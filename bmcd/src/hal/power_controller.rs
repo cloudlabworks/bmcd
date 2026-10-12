@@ -77,6 +77,9 @@ impl EnableChip for Chip {
     }
 }
 
+/// Output handles plus the per-line read results, see [`claim_enable_lines`].
+type Claimed<O> = ([O; 4], [anyhow::Result<bool>; 4]);
+
 /// Reads the level of the four enable lines as inputs, then claims them as
 /// outputs initialised to exactly the level that was read, so claiming them
 /// does not change what the pin carries. libgpiod 1 (what the `gpiod` crate
@@ -89,7 +92,7 @@ impl EnableChip for Chip {
 fn claim_enable_lines<C: EnableChip>(
     chip: &C,
     lines: [gpiod::LineId; 4],
-) -> anyhow::Result<([C::Out; 4], [anyhow::Result<bool>; 4])> {
+) -> anyhow::Result<Claimed<C::Out>> {
     let levels = lines.map(|line| chip.read_input(line));
     let mut outs = Vec::with_capacity(4);
     for (idx, line) in lines.into_iter().enumerate() {
