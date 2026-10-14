@@ -279,12 +279,6 @@ fn retarget(node: Value) -> Value {
     }
 }
 
-/// The document. Regenerated on every request; it is a few kilobytes and
-/// the alternative is a cache that outlives a version bump.
-/// `/api/bmc/access` and its two writes, described by hand.
-///
-/// A `problem+json` refusal is the same shape as everywhere else, so these
-/// reuse the `Problem` component rather than inventing a second error type.
 /// `GET /api/bmc?opt=set&type=flash`, which is not a route of its own: it is
 /// the legacy dispatcher's transfer branch, so it is described by hand.
 fn flash_path() -> Value {
@@ -308,16 +302,16 @@ fn flash_path() -> Value {
             param("node", "0-based node, 0 to 3."),
             param("file", "With `sdcard`: the path relative to the card, as returned by \
                 `GET /api/bmc/sdcard/files`. With `local`: an absolute path on the BMC. \
-                Otherwise a URL starting `http`, or the name of the file to upload. Required."),
+                Otherwise a URL starting `http://` or `https://`, or the name of the file to upload. Required."),
             param("sdcard", "`1` (or the key with an empty value) reads `file` from the \
                 microSD card. The path is confined to the card: absolute paths, `..`, symlinks \
                 leading out, missing files, directories and an unmounted card are refused with \
                 400. Cannot be combined with `local` or a URL."),
-            param("local", "Key present: `file` is an absolute path on the BMC. NOT confined \
+            param("local", "Key alone or `1|true|yes|on` (`0|false|no|off` is not local): `file` is an absolute path on the BMC. NOT confined \
                 to the card; use `sdcard` unless you need another place."),
             param("length", "Size in bytes of the upload. Required, else 411, unless \
                 `sdcard`, `local` or a URL is used."),
-            param("sha256", "Hex digest the image must match."),
+            param("sha256", "Hex SHA-256 the image must match, verified as it is read for every source (upload, URL, `local`, `sdcard`); a mismatch fails the transfer."),
             param("skip_crc", "Skip verifying the written image. Skipped when present with \
                 an empty value or `1`, `true`, `yes`, `on` (any case); verified when absent or \
                 `0`, `false`, `no`, `off`. Any other value is 400 `Invalid `skip_crc` value`."),
@@ -335,6 +329,12 @@ fn flash_path() -> Value {
     } })
 }
 
+/// The document. Regenerated on every request; it is a few kilobytes and
+/// the alternative is a cache that outlives a version bump.
+/// `/api/bmc/access` and its two writes, described by hand.
+///
+/// A `problem+json` refusal is the same shape as everywhere else, so these
+/// reuse the `Problem` component rather than inventing a second error type.
 fn access_paths() -> Vec<(String, Value)> {
     let problem = json!({
         "description": "A refusal, RFC 9457.",

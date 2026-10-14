@@ -25,7 +25,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (an absolute path, not confined, as `tpi flash --local` uses it); it is now
   documented as such, next to `sdcard`, in the OpenAPI document, which also
   describes the flash parameters for the first time. The firmware upgrade
-  shares the same code and accepts `sdcard` too.
+  shares the same code and accepts `sdcard` too. A file on the card cannot
+  be named under `os_upgrade/`, which an upgrade empties before it stages.
+  `sha256` is now checked for `sdcard` and `local` flashes, as it is for
+  uploads and URLs; before, it was accepted and ignored. `local=0` no longer
+  counts as `local`, and a card file named `httpd.img` is no longer taken for
+  a URL.
 
 ### Fixed
 

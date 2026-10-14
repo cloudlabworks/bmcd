@@ -71,7 +71,7 @@ const PARK_MOUNT: &str = "/mnt/sdcard";
 const PARK_DIR: &str = "/mnt/sdcard/firmware";
 /// Directory created under the chosen staging location, removed again when
 /// `osupdate` returns.
-const UPGRADE_DIR_NAME: &str = "os_upgrade";
+pub(crate) const UPGRADE_DIR_NAME: &str = "os_upgrade";
 const BLOCK_WRITE_SIZE: usize = BLOCK_READ_SIZE; // 512Kib
 const BLOCK_READ_SIZE: usize = 524288; // 512Kib
 
@@ -432,7 +432,7 @@ fn select_staging_dir(image_size: u64) -> PathBuf {
 /// one of the directory it sits in. Both `/mnt/sdcard` and `/mnt/overlay` exist
 /// as empty directories when nothing is mounted on them, and writing an image
 /// there would land on the small root filesystem instead.
-fn is_mount_point(path: &Path) -> bool {
+pub(crate) fn is_mount_point(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         // `/` has no parent and is always a mount point.
         return true;

@@ -38,6 +38,8 @@ use tokio_util::io::StreamReader;
 pub enum DataTransfer {
     Local {
         path: PathBuf,
+        /// Checked as the file is read, like an upload's or a URL's.
+        sha256: Option<bytes::Bytes>,
     },
     Remote {
         file_name: PathBuf,
@@ -54,8 +56,8 @@ pub enum DataTransfer {
 }
 
 impl DataTransfer {
-    pub fn local(path: PathBuf) -> Self {
-        Self::Local { path }
+    pub fn local(path: PathBuf, sha256: Option<bytes::Bytes>) -> Self {
+        Self::Local { path, sha256 }
     }
 
     pub fn remote(
@@ -93,7 +95,7 @@ impl DataTransfer {
 impl DataTransfer {
     pub fn file_name(&self) -> anyhow::Result<&OsStr> {
         match self {
-            DataTransfer::Local { path } => Ok(path
+            DataTransfer::Local { path, .. } => Ok(path
                 .file_name()
                 .ok_or(std::io::Error::from(ErrorKind::InvalidInput))?),
             DataTransfer::Remote {
@@ -113,7 +115,7 @@ impl DataTransfer {
 
     pub fn size(&self) -> anyhow::Result<u64> {
         match self {
-            DataTransfer::Local { path } => {
+            DataTransfer::Local { path, .. } => {
                 let mut file = std::fs::OpenOptions::new()
                     .read(true)
                     .open(path)
@@ -147,14 +149,23 @@ impl DataTransfer {
 
     pub async fn reader(&mut self) -> anyhow::Result<impl AsyncRead + Sync + Send + Unpin> {
         match self {
-            DataTransfer::Local { path } => {
+            DataTransfer::Local { path, sha256 } => {
                 let file = OpenOptions::new()
                     .read(true)
                     .open(&path)
                     .await
                     .with_context(|| path.to_string_lossy().to_string())?;
 
-                Ok(with_decompression_support(path, BufReader::new(file)))
+                match sha256 {
+                    // Same validator as an upload or a URL, over the file's
+                    // bytes as stored (before any decompression).
+                    Some(_) => Ok(build_reader_object(
+                        path,
+                        sha256.clone(),
+                        tokio_util::io::ReaderStream::new(file),
+                    )),
+                    None => Ok(with_decompression_support(path, BufReader::new(file))),
+                }
             }
             DataTransfer::Remote {
                 file_name,
