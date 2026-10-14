@@ -10,6 +10,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.39.0] — 2026-10-15
+
+### Added
+
+- **A node can be flashed from an image on the SD card, by the path the card
+  listing gives.** `opt=set&type=flash&node=<0..3>&sdcard=1&file=<path>` takes
+  `file` as the path relative to the card that `GET /sdcard/files` returns,
+  and it is confined to the card the way the listing is: an absolute path, a
+  `..` that leaves the card, a symlink that points out of it, a missing file,
+  a directory and an unmounted card are each refused with a 400 and a message
+  saying which. It cannot be combined with `local` or a URL. Until now the
+  listing offered paths that nothing could take back. `local` is unchanged
+  (an absolute path, not confined, as `tpi flash --local` uses it); it is now
+  documented as such, next to `sdcard`, in the OpenAPI document, which also
+  describes the flash parameters for the first time. The firmware upgrade
+  shares the same code and accepts `sdcard` too. A file on the card cannot
+  be named under `os_upgrade/`, which an upgrade empties before it stages.
+  `sha256` is now checked for `sdcard` and `local` flashes, as it is for
+  uploads and URLs; before, it was accepted and ignored. `local=0` no longer
+  counts as `local`, and a card file named `httpd.img` is no longer taken for
+  a URL.
+
+### Fixed
+
+- **`skip_crc=false` skipped the CRC check.** The flag was read by whether the
+  key was present, not by its value, so `skip_crc=false` and `skip_crc=0`
+  turned verification off. The web interface has sent `skip_crc=false` on every
+  flash since BMC-UI 3.25.0, so every node flash started from the web
+  interface skipped the check. Now `skip_crc` skips only when it is present
+  with an empty value or `1`, `true`, `yes`, `on` (any case), which keeps
+  `tpi`'s key-only `skip_crc` working; `0`, `false`, `no`, `off` and an absent
+  key verify; any other value is refused with 400 "Invalid `skip_crc` value".
+  Reported by a user on Discord.
+
 ## [2.38.4] — 2026-10-06
 
 ### Fixed

@@ -1165,7 +1165,7 @@ async fn handle_transfer_request(
     };
 
     let data_transfer = create_data_transfer(&query).await?;
-    let do_crc = !query.contains_key("skip_crc");
+    let do_crc = !flag(&query, "skip_crc")?;
     let transfer_request =
         InitializeTransfer::new(process_name, upgrade_command, data_transfer, do_crc);
 
@@ -1174,18 +1174,140 @@ async fn handle_transfer_request(
     Ok(json.to_string())
 }
 
+/// Read a switch-like query parameter.
+///
+/// Absent is `false`. Present with an empty value, `1`, `true`, `yes` or `on`
+/// (any case) is `true`, so a key-only `?skip_crc` -- which is how `tpi` sends
+/// it -- keeps meaning what it always did. `0`, `false`, `no` and `off` are
+/// `false`. Anything else is refused rather than guessed at: the web interface
+/// sent `skip_crc=false` on every flash and was read as "skip", because the
+/// old check only asked whether the key was there.
+fn flag(query: &Query, name: &str) -> LegacyResult<bool> {
+    let Some(value) = query.get(name) else {
+        return Ok(false);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(LegacyResponse::bad_request(format!(
+            "Invalid `{name}` value"
+        ))),
+    }
+}
+
 async fn create_data_transfer(query: &Query) -> LegacyResult<DataTransfer> {
+    let root = Path::new(crate::app::sdcard_files::SDCARD_ROOT);
+    let mounted = crate::app::upgrade_worker::is_mount_point(root);
+    create_data_transfer_in(query, root, mounted).await
+}
+
+/// A url the BMC should download: `http://` or `https://`, any case. Not just
+/// a name starting with "http" -- `httpd.img` is a file.
+fn is_url(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Resolve `file` on the microSD card mounted at `root`, for `sdcard=1`.
+///
+/// `file` is the card-relative `path` that `GET /sdcard/files` hands out, and
+/// goes through the same [`sdcard_files::resolve`] as the listing, so `..`
+/// and symlinks leading out of the card are refused by the same rule. An
+/// absolute path is refused here, because `resolve` would strip the slash and
+/// read it as relative to the card, which is not what the caller wrote.
+fn resolve_sdcard_file(root: &Path, mounted: bool, file: &str) -> LegacyResult<PathBuf> {
+    use crate::app::sdcard_files::{self, SdCardError};
+
+    // `/mnt/sdcard` exists as an empty directory when nothing is mounted on
+    // it, so "the directory is there" does not mean the card is.
+    if !mounted {
+        return Err(LegacyResponse::bad_request(
+            "the microSD card is not mounted",
+        ));
+    }
+    if file.starts_with('/') {
+        return Err(LegacyResponse::bad_request(
+            "`file` must be a path relative to the microSD card, not an absolute path",
+        ));
+    }
+    let resolved = sdcard_files::resolve(root, file).map_err(|err| match err {
+        SdCardError::NotMounted => LegacyResponse::bad_request("the microSD card is not mounted"),
+        SdCardError::OutsideRoot => {
+            LegacyResponse::bad_request("`file` is outside the microSD card")
+        }
+        SdCardError::NotFound => {
+            LegacyResponse::bad_request("`file` does not exist on the microSD card")
+        }
+        other => LegacyResponse::bad_request(format!("`file` could not be read: {other}")),
+    })?;
+    if !resolved.is_file() {
+        return Err(LegacyResponse::bad_request(
+            "`file` is not a file on the microSD card",
+        ));
+    }
+    // A firmware upgrade stages its image under this directory on the card
+    // and clears it first, which would truncate its own source.
+    let staging = root
+        .canonicalize()
+        .map(|r| r.join(crate::app::upgrade_worker::UPGRADE_DIR_NAME));
+    if staging
+        .map(|dir| resolved.starts_with(dir))
+        .unwrap_or(false)
+    {
+        return Err(LegacyResponse::bad_request(
+            "`file` is in the firmware upgrade staging directory of the microSD card, \
+             which an upgrade empties; copy it elsewhere on the card first",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Where the image comes from. In order:
+///
+/// * `sdcard` -- `file` is a path on the microSD card, relative to it, as
+///   listed by `GET /sdcard/files`. Confined to the card. Cannot be combined
+///   with `local` or with a URL.
+/// * `local` (key alone, or `1|true|yes|on`) -- `file` is an absolute path on the BMC. NOT confined: it reads
+///   anything the daemon can. `tpi flash --local` uses it. `sdcard` is the
+///   confined form for a client that is not a trusted operator's shell.
+/// * `file` starting with `http://` or `https://` -- the BMC downloads it.
+/// * otherwise the image is uploaded by the client, and `length` is required.
+///
+/// `sha256`, when given, is verified for every source as the bytes are read.
+async fn create_data_transfer_in(
+    query: &Query,
+    sdcard_root: &Path,
+    sdcard_mounted: bool,
+) -> LegacyResult<DataTransfer> {
     let file = query.get("file").ok_or(LegacyResponse::bad_request(
         "Invalid `file` query parameter",
     ))?;
 
-    if query.contains_key("local") {
-        return Ok(DataTransfer::local(PathBuf::from(file)));
+    let sha256 = try_map_sha256(query.get("sha256"))?;
+    let local = flag(query, "local")?;
+
+    if flag(query, "sdcard")? {
+        if local {
+            return Err(LegacyResponse::bad_request(
+                "`sdcard` and `local` cannot be combined",
+            ));
+        }
+        if is_url(file) {
+            return Err(LegacyResponse::bad_request(
+                "`sdcard` takes a path on the microSD card, not a url",
+            ));
+        }
+        return Ok(DataTransfer::local(
+            resolve_sdcard_file(sdcard_root, sdcard_mounted, file)?,
+            sha256,
+        ));
     }
 
-    let sha256 = try_map_sha256(query.get("sha256"))?;
+    if local {
+        return Ok(DataTransfer::local(PathBuf::from(file), sha256));
+    }
 
-    if file.starts_with("http") {
+    if is_url(file) {
         let url = reqwest::Url::parse(file).map_err(|e| {
             LegacyResponse::bad_request(format!(
                 "{file} could not be parsed to a url object: {:#}",
@@ -1276,6 +1398,213 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+
+    fn q(pairs: &[(&str, &str)]) -> Query {
+        web::Query(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn err_status(result: LegacyResult<DataTransfer>) -> (StatusCode, String) {
+        match result {
+            Err(LegacyResponse::Error(status, msg)) => (status, msg.into_owned()),
+            Err(_) => panic!("expected an error response"),
+            Ok(t) => panic!("expected a refusal, got {t:?}"),
+        }
+    }
+
+    /// A card laid out in a fresh directory: `images/os.img`, `images/dir/`,
+    /// and `escape` -> a file outside the card.
+    fn card(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("bmcd-sdflash-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("card");
+        std::fs::create_dir_all(root.join("images/dir")).unwrap();
+        std::fs::write(root.join("images/os.img"), b"image").unwrap();
+        std::fs::write(root.join("httpd.img"), b"image").unwrap();
+        std::fs::create_dir_all(root.join("os_upgrade")).unwrap();
+        std::fs::write(root.join("os_upgrade/staged.img"), b"image").unwrap();
+        std::fs::write(base.join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(base.join("secret"), root.join("escape")).unwrap();
+        (base, root)
+    }
+
+    #[tokio::test]
+    async fn sdcard_flash_resolves_under_the_card_root() {
+        let (base, root) = card("ok");
+        let query = q(&[("file", "images/os.img"), ("sdcard", "1")]);
+        match create_data_transfer_in(&query, &root, true).await {
+            Ok(DataTransfer::Local { path, .. }) => {
+                assert_eq!(path, root.canonicalize().unwrap().join("images/os.img"));
+            }
+            other => panic!("expected a local transfer, got {other:?}"),
+        }
+        // the key alone, empty value, means the same
+        let query = q(&[("file", "images/os.img"), ("sdcard", "")]);
+        assert!(matches!(
+            create_data_transfer_in(&query, &root, true).await,
+            Ok(DataTransfer::Local { .. })
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdcard_flash_refuses_what_is_not_a_file_on_the_card() {
+        let (base, root) = card("refuse");
+        for file in [
+            "../secret",
+            "images/../../secret",
+            "/etc/passwd",
+            "escape",
+            "images/dir",
+            "images",
+            "",
+            "missing.img",
+        ] {
+            let query = q(&[("file", file), ("sdcard", "1")]);
+            let (status, msg) = err_status(create_data_transfer_in(&query, &root, true).await);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{file:?}: {msg}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdcard_flash_with_no_card_is_refused() {
+        let missing = std::env::temp_dir().join("bmcd-sdflash-no-such-card");
+        let query = q(&[("file", "os.img"), ("sdcard", "1")]);
+        let (status, msg) = err_status(create_data_transfer_in(&query, &missing, false).await);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not mounted"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn sdcard_cannot_be_combined_with_local_or_a_url() {
+        let (base, root) = card("combine");
+        for pairs in [
+            vec![("file", "images/os.img"), ("sdcard", "1"), ("local", "")],
+            vec![("file", "http://example.com/os.img"), ("sdcard", "1")],
+        ] {
+            let (status, _) = err_status(create_data_transfer_in(&q(&pairs), &root, true).await);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_named_like_http_is_a_file_and_the_staging_dir_is_refused() {
+        let (base, root) = card("names");
+        let query = q(&[("file", "httpd.img"), ("sdcard", "1")]);
+        assert!(matches!(
+            create_data_transfer_in(&query, &root, true).await,
+            Ok(DataTransfer::Local { .. })
+        ));
+        for url in ["http://x/os.img", "HTTPS://x/os.img"] {
+            let query = q(&[("file", url), ("sdcard", "1")]);
+            let (status, _) = err_status(create_data_transfer_in(&query, &root, true).await);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let query = q(&[("file", "os_upgrade/staged.img"), ("sdcard", "1")]);
+        let (status, msg) = err_status(create_data_transfer_in(&query, &root, true).await);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("staging"), "{msg}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_existing_but_unmounted_card_is_refused() {
+        let (base, root) = card("unmounted");
+        let query = q(&[("file", "images/os.img"), ("sdcard", "1")]);
+        let (status, msg) = err_status(create_data_transfer_in(&query, &root, false).await);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not mounted"), "{msg}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_zero_is_not_local() {
+        let (base, root) = card("local0");
+        // sdcard with local=0 is not a combination
+        let query = q(&[("file", "images/os.img"), ("sdcard", "1"), ("local", "0")]);
+        assert!(matches!(
+            create_data_transfer_in(&query, &root, true).await,
+            Ok(DataTransfer::Local { .. })
+        ));
+        // without sdcard, local=0 falls through to the upload branch: no length
+        let query = q(&[("file", "/etc/passwd"), ("local", "0")]);
+        let (status, _) = err_status(create_data_transfer_in(&query, &root, true).await);
+        assert_eq!(status, StatusCode::LENGTH_REQUIRED);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    async fn read_all(mut t: DataTransfer) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut reader = t.reader().await.unwrap();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn sha256_is_verified_for_sdcard_and_local() {
+        use sha2::{Digest, Sha256};
+        let (base, root) = card("sha");
+        let good = hex::encode(Sha256::digest(b"image"));
+        let bad = hex::encode(Sha256::digest(b"other"));
+        let local_path = root.join("images/os.img").to_string_lossy().into_owned();
+        let sdcard = |sha: &str| q(&[("file", "images/os.img"), ("sdcard", "1"), ("sha256", sha)]);
+        let local = |sha: &str| {
+            q(&[
+                ("file", local_path.as_str()),
+                ("local", ""),
+                ("sha256", sha),
+            ])
+        };
+
+        for (query, label) in [(sdcard(&good), "sdcard"), (local(&good), "local")] {
+            let t = create_data_transfer_in(&query, &root, true).await.unwrap();
+            assert_eq!(read_all(t).await.unwrap(), b"image", "{label}");
+        }
+        for (query, label) in [(sdcard(&bad), "sdcard"), (local(&bad), "local")] {
+            let t = create_data_transfer_in(&query, &root, true).await.unwrap();
+            assert!(
+                read_all(t).await.is_err(),
+                "{label}: wrong digest must fail"
+            );
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_stays_unconfined() {
+        let query = q(&[("file", "/etc/passwd"), ("local", "")]);
+        match create_data_transfer_in(&query, Path::new("/nonexistent"), false).await {
+            Ok(DataTransfer::Local { path, .. }) => assert_eq!(path, PathBuf::from("/etc/passwd")),
+            other => panic!("expected a local transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skip_crc_is_read_by_value_not_by_presence() {
+        for pairs in [vec![], vec![("skip_crc", "false")], vec![("skip_crc", "0")]] {
+            assert!(!flag(&q(&pairs), "skip_crc").unwrap(), "{pairs:?}");
+        }
+        for v in ["", "true", "1", "TRUE", "yes", "On"] {
+            assert!(flag(&q(&[("skip_crc", v)]), "skip_crc").unwrap(), "{v:?}");
+        }
+        for v in ["no", "OFF", "False"] {
+            assert!(!flag(&q(&[("skip_crc", v)]), "skip_crc").unwrap(), "{v:?}");
+        }
+        match flag(&q(&[("skip_crc", "maybe")]), "skip_crc") {
+            Err(LegacyResponse::Error(status, msg)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(msg, "Invalid `skip_crc` value");
+            }
+            _ => panic!("expected a refusal"),
+        }
+    }
     use crate::app::thermal_info::{Cooler, Thermal, ThermalSensor, Trip};
 
     #[test]
