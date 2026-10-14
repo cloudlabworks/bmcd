@@ -285,6 +285,56 @@ fn retarget(node: Value) -> Value {
 ///
 /// A `problem+json` refusal is the same shape as everywhere else, so these
 /// reuse the `Problem` component rather than inventing a second error type.
+/// `GET /api/bmc?opt=set&type=flash`, which is not a route of its own: it is
+/// the legacy dispatcher's transfer branch, so it is described by hand.
+fn flash_path() -> Value {
+    let param = |name: &str, description: &str| {
+        json!({ "name": name, "in": "query", "required": false,
+                "description": description, "schema": { "type": "string" } })
+    };
+    json!({ "get": {
+        "summary": "Write an image to a node (opt=set&type=flash)",
+        "operationId": "legacyFlashNode",
+        "description": "Starts writing an image to a compute module and answers `{\"handle\": N}`; \
+            progress is `GET /api/bmc?opt=get&type=flash`. The image comes from one of: \
+            `sdcard` (a file on the microSD card), `local` (an absolute path on the BMC), \
+            an `http…` `file` (the BMC downloads it), or an upload to `/api/bmc/upload/{handle}` \
+            with `length`. `type=firmware` takes the same image parameters. A refusal is \
+            `{\"response\":[{\"result\":\"…\"}]}` with status 400 (bad or conflicting \
+            parameter) or 411 (an upload without `length`).",
+        "parameters": [
+            param("opt", "`set`"),
+            param("type", "`flash`"),
+            param("node", "0-based node, 0 to 3."),
+            param("file", "With `sdcard`: the path relative to the card, as returned by \
+                `GET /api/bmc/sdcard/files`. With `local`: an absolute path on the BMC. \
+                Otherwise a URL starting `http`, or the name of the file to upload. Required."),
+            param("sdcard", "`1` (or the key with an empty value) reads `file` from the \
+                microSD card. The path is confined to the card: absolute paths, `..`, symlinks \
+                leading out, missing files, directories and an unmounted card are refused with \
+                400. Cannot be combined with `local` or a URL."),
+            param("local", "Key present: `file` is an absolute path on the BMC. NOT confined \
+                to the card; use `sdcard` unless you need another place."),
+            param("length", "Size in bytes of the upload. Required, else 411, unless \
+                `sdcard`, `local` or a URL is used."),
+            param("sha256", "Hex digest the image must match."),
+            param("skip_crc", "Skip verifying the written image. Skipped when present with \
+                an empty value or `1`, `true`, `yes`, `on` (any case); verified when absent or \
+                `0`, `false`, `no`, `off`. Any other value is 400 `Invalid `skip_crc` value`."),
+        ],
+        "responses": {
+            "200": { "description": "`{\"handle\": N}`",
+                     "content": { "application/json": { "schema": {} } } },
+            "400": { "description": "A parameter is missing, invalid or conflicting." },
+            "411": { "description": "An upload without `length`." },
+            "default": {
+                "description": "A refusal, RFC 9457.",
+                "content": { "application/problem+json": { "schema": component_ref("Problem") } }
+            }
+        }
+    } })
+}
+
 fn access_paths() -> Vec<(String, Value)> {
     let problem = json!({
         "description": "A refusal, RFC 9457.",
@@ -778,6 +828,7 @@ pub fn document() -> Value {
     for (path, entry) in access_paths() {
         paths.insert(path, entry);
     }
+    paths.insert("/api/bmc".to_string(), flash_path());
 
     let mut schema_components = components();
     schema_components.insert(
@@ -935,6 +986,7 @@ mod tests {
     /// the alias table stays a deliberate act with its reason written down,
     /// which is the whole point of the assertion below.
     const NOT_ALIASES: &[(&str, &str)] = &[
+        ("/api/bmc", "get"),
         ("/api/bmc/access", "get"),
         ("/api/bmc/access/password", "post"),
         ("/api/bmc/access/client-ca", "put"),
