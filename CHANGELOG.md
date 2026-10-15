@@ -26,6 +26,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   board with a fanout hub a supported device on the wrong port is still
   reported as such. Found from a user report on Discord, where a Zigbee
   stick (`1a86:7523`) in node 2's slot kept an RK1 from enumerating.
+- **A cancelled flash stops waiting at once, and a flash that never starts
+  puts the node back.** The wait for the boot device honours the cancel
+  token, so a cancel (or a client that gave up) no longer leaves a worker
+  polling for up to 15 s against a restarted flash. When the device does not
+  appear, the node is powered off and USB restored exactly as after any other
+  failed flash, instead of staying powered in flashing mode while the error
+  tells the user to retry; the original error is the one returned.
 
 ## [2.39.0] — 2026-10-15
 

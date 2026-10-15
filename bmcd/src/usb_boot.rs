@@ -18,9 +18,10 @@ use self::{rockusb::RockusbBoot, rpiboot::RpiBoot};
 use crate::hal::NodeId;
 use async_trait::async_trait;
 use rusb::GlobalContext;
-use std::{fmt::Display, path::PathBuf, time::Duration};
+use std::{collections::HashSet, fmt::Display, path::PathBuf, time::Duration};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 use topology::{HubTopology, UsbPortPath};
 use tracing::{info, warn};
 
@@ -40,7 +41,10 @@ pub trait UsbBoot: 'static + Send + Sync + Display {
         _device: &rusb::Device<GlobalContext>,
         _port: Option<&UsbPortPath>,
     ) -> Result<PathBuf, UsbBootError> {
-        Err(UsbBootError::NotSupported)
+        // Every backend overrides this; one that does not cannot do it.
+        Err(UsbBootError::internal_error(
+            "this USB boot backend cannot load a block device",
+        ))
     }
 
     async fn load_as_stream(
@@ -106,6 +110,7 @@ impl NodeDrivers {
     async fn find_for_node(
         &self,
         node: NodeId,
+        cancel: &CancellationToken,
     ) -> Result<(rusb::Device<GlobalContext>, &dyn UsbBoot), UsbBootError> {
         tracing::info!(
             "Waiting for the USB boot device of node {}...",
@@ -117,6 +122,7 @@ impl NodeDrivers {
             node.number(),
             BOOT_DEVICE_WAIT,
             POLL_INTERVAL,
+            cancel,
             || {
                 let devices = rusb::devices()?;
                 Ok(devices
@@ -159,8 +165,12 @@ impl NodeDrivers {
         }
     }
 
-    pub async fn load_as_block_device(&self, node: NodeId) -> Result<PathBuf, UsbBootError> {
-        let (device, driver) = self.find_for_node(node).await?;
+    pub async fn load_as_block_device(
+        &self,
+        node: NodeId,
+        cancel: &CancellationToken,
+    ) -> Result<PathBuf, UsbBootError> {
+        let (device, driver) = self.find_for_node(node, cancel).await?;
         let here = self
             .expected_ports(node)
             .map(|_| Self::actual_path(&device));
@@ -170,8 +180,9 @@ impl NodeDrivers {
     pub async fn load_as_stream(
         &self,
         node: NodeId,
+        cancel: &CancellationToken,
     ) -> Result<Box<dyn DataTransport>, UsbBootError> {
-        let (device, driver) = self.find_for_node(node).await?;
+        let (device, driver) = self.find_for_node(node, cancel).await?;
         let here = self
             .expected_ports(node)
             .map(|_| Self::actual_path(&device));
@@ -181,13 +192,18 @@ impl NodeDrivers {
 
 #[derive(Error, Debug)]
 pub enum UsbBootError {
-    #[error("Compute module's USB interface not found or supported")]
-    NotSupported,
+    /// The flash was cancelled while waiting for the module.
+    #[error("cancelled while waiting for the module's USB boot device")]
+    Cancelled,
     /// The module never showed up. Names what else was on the lines, since a
     /// device in the mini-PCIe slot of nodes 1 and 2 shares the USB pair and
     /// can keep the module from enumerating.
-    #[error("{}", timeout_message(*.node, others))]
-    BootDeviceTimeout { node: u8, others: Vec<String> },
+    #[error("{}", timeout_message(*.node, *.waited, others))]
+    BootDeviceTimeout {
+        node: u8,
+        waited: Duration,
+        others: Vec<String>,
+    },
     /// The whole point of this error is that it is not a success message.
     /// Every wrong-node flash so far ended with "done" and a module that had
     /// not been written, so the text names the port asked for and the port
@@ -221,18 +237,23 @@ pub(crate) struct SeenDevice<D> {
     pub device: D,
 }
 
-fn timeout_message(node: u8, others: &[String]) -> String {
+fn timeout_message(node: u8, waited: Duration, others: &[String]) -> String {
+    let waited = if waited.subsec_millis() == 0 {
+        format!("{} s", waited.as_secs())
+    } else {
+        format!("{} ms", waited.as_millis())
+    };
     let head = format!(
         "node {node}: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
-         did not appear within {} s",
-        BOOT_DEVICE_WAIT.as_secs()
+         did not appear within {waited}"
     );
     if others.is_empty() {
         head
     } else {
         format!(
-            "{head}; other USB devices present: {}. A device in the node's mini-PCIe slot \
-             (nodes 1 and 2) can share the USB lines used for flashing; remove it and retry",
+            "{head}; other USB devices present: {}. If one of them is a device in the node's \
+             mini-PCIe slot (nodes 1 and 2), it shares the USB lines used for flashing; \
+             remove it and retry",
             others.join(", ")
         )
     }
@@ -254,6 +275,7 @@ fn look<D>(
     expected: Option<&Vec<u8>>,
     node: u8,
     devices: Vec<SeenDevice<D>>,
+    logged: &mut HashSet<String>,
 ) -> Look<D> {
     let mut elsewhere = Vec::new();
     let mut others = Vec::new();
@@ -261,7 +283,12 @@ fn look<D>(
 
     for dev in devices {
         let (vid, pid) = dev.vid_pid;
-        info!("trying {:#06x}:{:#06x}", vid, pid);
+        // Logged once per distinct device per wait: this runs every 250 ms
+        // on a board with little RAM, and the same line forty times is noise.
+        let first = logged.insert(format!("{vid:04x}:{pid:04x}@{}", dev.handle));
+        if first {
+            info!("trying {:#06x}:{:#06x} on {}", vid, pid, dev.handle);
+        }
         let backend = backends.iter().position(|b| b.is_supported(&dev.vid_pid));
         let on_port = expected.is_none_or(|e| dev.ports == *e);
         match backend {
@@ -280,15 +307,17 @@ fn look<D>(
                 // hub. A Rockchip in maskrom is high-speed, so pinning the bus
                 // to 1 refused every node it was asked to flash. The port
                 // chain says which module this is; the bus says nothing.
-                warn!(
-                    "ignoring {} on {}: node {} is on port {}",
-                    backends[idx],
-                    dev.handle,
-                    node,
-                    expected
-                        .map(|e| UsbPortPath::describe_ports(e))
-                        .unwrap_or_default()
-                );
+                if first {
+                    warn!(
+                        "ignoring {} on {}: node {} is on port {}",
+                        backends[idx],
+                        dev.handle,
+                        node,
+                        expected
+                            .map(|e| UsbPortPath::describe_ports(e))
+                            .unwrap_or_default()
+                    );
+                }
                 elsewhere.push(format!("{} on {}", backends[idx], dev.handle));
             }
             None if on_port && vid != 0x1d6b => {
@@ -315,31 +344,50 @@ pub(crate) async fn wait_for_device<D>(
     node: u8,
     wait: Duration,
     interval: Duration,
+    cancel: &CancellationToken,
     mut enumerate: impl FnMut() -> Result<Vec<SeenDevice<D>>, UsbBootError>,
 ) -> Result<(D, usize), UsbBootError> {
     let deadline = tokio::time::Instant::now() + wait;
     let mut others: Vec<String> = Vec::new();
-    let mut elsewhere: Vec<String>;
+    let mut elsewhere: Vec<String> = Vec::new();
+    let mut logged = HashSet::new();
+    let mut enumerate_failed = false;
 
     loop {
-        match look(backends, expected.as_ref(), node, enumerate()?) {
-            Look::Found(dev, idx) => return Ok((dev.device, idx)),
-            Look::Missing {
-                elsewhere: e,
-                others: o,
-            } => {
-                for x in o {
-                    if !others.contains(&x) {
-                        others.push(x);
+        if cancel.is_cancelled() {
+            return Err(UsbBootError::Cancelled);
+        }
+        // A failed enumeration is retried until the deadline: the bus is
+        // busy re-enumerating exactly when this is most likely to fail.
+        match enumerate() {
+            Ok(devices) => match look(backends, expected.as_ref(), node, devices, &mut logged) {
+                Look::Found(dev, idx) => return Ok((dev.device, idx)),
+                Look::Missing {
+                    elsewhere: e,
+                    others: o,
+                } => {
+                    for x in o {
+                        if !others.contains(&x) {
+                            others.push(x);
+                        }
                     }
+                    elsewhere = e;
                 }
-                elsewhere = e;
+            },
+            Err(e) => {
+                if !enumerate_failed {
+                    warn!("listing USB devices failed, will retry: {e}");
+                    enumerate_failed = true;
+                }
             }
         }
         if tokio::time::Instant::now() + interval > deadline {
             break;
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = cancel.cancelled() => return Err(UsbBootError::Cancelled),
+        }
     }
 
     Err(match &expected {
@@ -348,7 +396,11 @@ pub(crate) async fn wait_for_device<D>(
             port: UsbPortPath::describe_ports(e),
             found: elsewhere.join(", "),
         },
-        _ => UsbBootError::BootDeviceTimeout { node, others },
+        _ => UsbBootError::BootDeviceTimeout {
+            node,
+            waited: wait,
+            others,
+        },
     })
 }
 
@@ -391,14 +443,22 @@ mod wait_tests {
     #[tokio::test]
     async fn found_on_third_poll() {
         let n = Cell::new(0);
-        let r = wait_for_device(&backends(), None, 1, Duration::from_secs(5), FAST, || {
-            n.set(n.get() + 1);
-            Ok(if n.get() < 3 {
-                vec![dev(0x1d6b, 2, &[])]
-            } else {
-                vec![dev(0x2207, 0x350b, &[1])]
-            })
-        })
+        let r = wait_for_device(
+            &backends(),
+            None,
+            1,
+            Duration::from_secs(5),
+            FAST,
+            &CancellationToken::new(),
+            || {
+                n.set(n.get() + 1);
+                Ok(if n.get() < 3 {
+                    vec![dev(0x1d6b, 2, &[])]
+                } else {
+                    vec![dev(0x2207, 0x350b, &[1])]
+                })
+            },
+        )
         .await;
         assert_eq!(r.unwrap(), (7, 0));
         assert_eq!(n.get(), 3);
@@ -412,6 +472,7 @@ mod wait_tests {
             2,
             Duration::from_millis(20),
             FAST,
+            &CancellationToken::new(),
             || Ok(vec![dev(0x1d6b, 2, &[]), dev(0x1a86, 0x7523, &[1, 2])]),
         )
         .await
@@ -420,25 +481,89 @@ mod wait_tests {
         assert_eq!(
             m,
             "node 2: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
-             did not appear within 15 s; other USB devices present: 1a86:7523. A device in the \
-             node's mini-PCIe slot (nodes 1 and 2) can share the USB lines used for flashing; \
-             remove it and retry"
+             did not appear within 20 ms; other USB devices present: 1a86:7523. If one of them is a \
+             device in the node's mini-PCIe slot (nodes 1 and 2), it shares the USB lines used \
+             for flashing; remove it and retry"
         );
         assert!(!m.contains("1d6b"));
     }
 
     #[tokio::test]
     async fn nothing_at_all_is_short() {
-        let e = wait_for_device::<u8>(&backends(), None, 3, Duration::from_millis(5), FAST, || {
-            Ok(vec![dev(0x1d6b, 1, &[])])
-        })
+        let e = wait_for_device::<u8>(
+            &backends(),
+            None,
+            3,
+            Duration::from_millis(5),
+            FAST,
+            &CancellationToken::new(),
+            || Ok(vec![dev(0x1d6b, 1, &[])]),
+        )
         .await
         .unwrap_err();
         assert_eq!(
             e.to_string(),
             "node 3: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
-             did not appear within 15 s"
+             did not appear within 5 ms"
         );
+    }
+
+    #[test]
+    fn real_wait_is_fifteen_seconds_in_the_text() {
+        let m = UsbBootError::BootDeviceTimeout {
+            node: 1,
+            waited: BOOT_DEVICE_WAIT,
+            others: vec![],
+        }
+        .to_string();
+        assert!(m.ends_with("did not appear within 15 s"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_wait_returns_promptly() {
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            c2.cancel();
+        });
+        let start = std::time::Instant::now();
+        let e = wait_for_device::<u8>(
+            &backends(),
+            None,
+            1,
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+            &cancel,
+            || Ok(vec![]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, UsbBootError::Cancelled), "{e}");
+        assert!(start.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn enumerate_errors_are_retried() {
+        let n = Cell::new(0);
+        let r = wait_for_device(
+            &backends(),
+            None,
+            1,
+            Duration::from_secs(5),
+            FAST,
+            &CancellationToken::new(),
+            || {
+                n.set(n.get() + 1);
+                if n.get() < 3 {
+                    Err(UsbBootError::RusbError(rusb::Error::Busy))
+                } else {
+                    Ok(vec![dev(0x2207, 0x350b, &[1])])
+                }
+            },
+        )
+        .await;
+        assert!(r.is_ok());
     }
 
     #[tokio::test]
@@ -451,6 +576,7 @@ mod wait_tests {
             2,
             Duration::from_millis(5),
             FAST,
+            &CancellationToken::new(),
             || Ok(vec![dev(0x2207, 0x350b, &[1]), dev(0x1a86, 0x7523, &[3])]),
         )
         .await
@@ -463,6 +589,7 @@ mod wait_tests {
             2,
             Duration::from_millis(5),
             FAST,
+            &CancellationToken::new(),
             || Ok(vec![dev(0x1a86, 0x7523, &[3]), dev(0x1a86, 0x7523, &[2])]),
         )
         .await
@@ -476,6 +603,7 @@ mod wait_tests {
             2,
             Duration::from_millis(5),
             FAST,
+            &CancellationToken::new(),
             || Ok(vec![dev(0x2207, 0x350b, &[2])]),
         )
         .await;
