@@ -18,11 +18,16 @@ use self::{rockusb::RockusbBoot, rpiboot::RpiBoot};
 use crate::hal::NodeId;
 use async_trait::async_trait;
 use rusb::GlobalContext;
-use std::{fmt::Display, path::PathBuf};
+use std::{fmt::Display, path::PathBuf, time::Duration};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 use topology::{HubTopology, UsbPortPath};
 use tracing::{info, warn};
+
+/// How long a flash waits for the module's USB boot device to appear.
+const BOOT_DEVICE_WAIT: Duration = Duration::from_secs(15);
+/// How often the bus is looked at while waiting.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub trait DataTransport: AsyncRead + AsyncWrite + AsyncSeek + Send + Unpin {}
 impl DataTransport for tokio::fs::File {}
@@ -93,82 +98,46 @@ impl NodeDrivers {
     ///
     /// Where it does not (v2.4, one mux, one node visible), the first match is
     /// correct and is what happens.
-    fn find_for_node(
+    ///
+    /// The bus is looked at again every `POLL_INTERVAL` until the device is
+    /// there or `BOOT_DEVICE_WAIT` has passed: a module takes a moment to
+    /// enumerate after power-on, and one that fails high-speed enumeration is
+    /// retried by the kernel, so a single look one second in gave up early.
+    async fn find_for_node(
         &self,
         node: NodeId,
     ) -> Result<(rusb::Device<GlobalContext>, &dyn UsbBoot), UsbBootError> {
-        tracing::info!("Checking for presence of a USB device...");
-        let expected = self.expected_ports(node);
-        let devices = rusb::devices()?;
-
-        // Devices a backend understands that are on the wrong port. Kept so a
-        // refusal can say what was there instead of only what was missing.
-        let mut seen_elsewhere: Vec<String> = Vec::new();
-
-        for backend in &self.backends {
-            for dev in devices.iter() {
-                let Ok(descriptor) = dev.device_descriptor() else {
-                    warn!("dropping {:?}, could not load descriptor", dev);
-                    continue;
-                };
-
-                let vid_pid = (descriptor.vendor_id(), descriptor.product_id());
-                info!("trying {:#06x}:{:#06x}", vid_pid.0, vid_pid.1);
-
-                if !backend.is_supported(&vid_pid) {
-                    continue;
-                }
-
-                info!("ID {:#06x}:{:#06x} {}", vid_pid.0, vid_pid.1, backend);
-
-                // No described hub: this board shows one node at a time, so
-                // the device that answered is the one that was asked for.
-                let Some(expected) = expected.as_ref() else {
-                    return Ok((dev, backend.as_ref()));
-                };
-
-                let here = Self::actual_path(&dev);
-
-                // PORTS, not the bus. The bus a device lands on is decided by
-                // its SPEED, not by where it is plugged in: this board pairs
-                // an OHCI and an EHCI controller as companions for the same
-                // physical ports, so a full-speed device appears on bus 1 and
-                // a high-speed one on bus 2 -- at the same port, on the same
-                // hub. A Rockchip in maskrom is high-speed, so pinning the bus
-                // to 1 refused every node it was asked to flash:
-                //
-                //   node 2 requested on 1-1.2; found Rockusb on 2-1.2 instead
-                //
-                // Measured on bmc-2, 2026-09-11, with a module that was
-                // perfectly healthy. The port chain is the part that says
-                // which module this is; the bus says nothing about identity.
-                if here.ports == *expected {
-                    return Ok((dev, backend.as_ref()));
-                }
-
-                warn!(
-                    "ignoring {} on {}: node {} is on port {}",
-                    backend,
-                    here,
-                    node.number(),
-                    UsbPortPath::describe_ports(expected)
-                );
-                seen_elsewhere.push(format!("{} on {}", backend, here));
-            }
-        }
-
-        Err(match expected {
-            Some(expected) if !seen_elsewhere.is_empty() => UsbBootError::WrongPort {
-                node: node.number(),
-                port: UsbPortPath::describe_ports(&expected),
-                found: seen_elsewhere.join(", "),
+        tracing::info!(
+            "Waiting for the USB boot device of node {}...",
+            node.number()
+        );
+        let (device, idx) = wait_for_device(
+            &self.backends,
+            self.expected_ports(node),
+            node.number(),
+            BOOT_DEVICE_WAIT,
+            POLL_INTERVAL,
+            || {
+                let devices = rusb::devices()?;
+                Ok(devices
+                    .iter()
+                    .filter_map(|dev| match dev.device_descriptor() {
+                        Ok(d) => Some(SeenDevice {
+                            vid_pid: (d.vendor_id(), d.product_id()),
+                            ports: dev.port_numbers().unwrap_or_default(),
+                            handle: Self::actual_path(&dev),
+                            device: dev,
+                        }),
+                        Err(_) => {
+                            warn!("dropping {:?}, could not load descriptor", dev);
+                            None
+                        }
+                    })
+                    .collect())
             },
-            Some(expected) => UsbBootError::NotOnPort {
-                node: node.number(),
-                port: UsbPortPath::describe_ports(&expected),
-            },
-            None => UsbBootError::NotSupported,
-        })
+        )
+        .await?;
+        Ok((device, self.backends[idx].as_ref()))
     }
 
     /// Which hub port a node hangs off, or `None` on a board that describes
@@ -191,7 +160,7 @@ impl NodeDrivers {
     }
 
     pub async fn load_as_block_device(&self, node: NodeId) -> Result<PathBuf, UsbBootError> {
-        let (device, driver) = self.find_for_node(node)?;
+        let (device, driver) = self.find_for_node(node).await?;
         let here = self
             .expected_ports(node)
             .map(|_| Self::actual_path(&device));
@@ -202,7 +171,7 @@ impl NodeDrivers {
         &self,
         node: NodeId,
     ) -> Result<Box<dyn DataTransport>, UsbBootError> {
-        let (device, driver) = self.find_for_node(node)?;
+        let (device, driver) = self.find_for_node(node).await?;
         let here = self
             .expected_ports(node)
             .map(|_| Self::actual_path(&device));
@@ -214,6 +183,11 @@ impl NodeDrivers {
 pub enum UsbBootError {
     #[error("Compute module's USB interface not found or supported")]
     NotSupported,
+    /// The module never showed up. Names what else was on the lines, since a
+    /// device in the mini-PCIe slot of nodes 1 and 2 shares the USB pair and
+    /// can keep the module from enumerating.
+    #[error("{}", timeout_message(*.node, others))]
+    BootDeviceTimeout { node: u8, others: Vec<String> },
     /// The whole point of this error is that it is not a success message.
     /// Every wrong-node flash so far ended with "done" and a module that had
     /// not been written, so the text names the port asked for and the port
@@ -224,8 +198,6 @@ pub enum UsbBootError {
         port: String,
         found: String,
     },
-    #[error("node {node} requested on {port}; nothing is in maskrom or rockusb there")]
-    NotOnPort { node: u8, port: String },
     #[error("USB")]
     RusbError(#[from] rusb::Error),
     #[error(transparent)]
@@ -237,5 +209,276 @@ pub enum UsbBootError {
 impl UsbBootError {
     pub fn internal_error<E: ToString>(error: E) -> UsbBootError {
         UsbBootError::InternalError(error.to_string())
+    }
+}
+
+/// One USB device as seen in a single look at the bus. `D` is the handle the
+/// caller wants back for the winner (a `rusb::Device`); tests use `()`.
+pub(crate) struct SeenDevice<D> {
+    pub vid_pid: (u16, u16),
+    pub ports: Vec<u8>,
+    pub handle: UsbPortPath,
+    pub device: D,
+}
+
+fn timeout_message(node: u8, others: &[String]) -> String {
+    let head = format!(
+        "node {node}: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+         did not appear within {} s",
+        BOOT_DEVICE_WAIT.as_secs()
+    );
+    if others.is_empty() {
+        head
+    } else {
+        format!(
+            "{head}; other USB devices present: {}. A device in the node's mini-PCIe slot \
+             (nodes 1 and 2) can share the USB lines used for flashing; remove it and retry",
+            others.join(", ")
+        )
+    }
+}
+
+/// Result of one look at the bus.
+enum Look<D> {
+    Found(SeenDevice<D>, usize),
+    Missing {
+        /// Supported devices on the wrong port.
+        elsewhere: Vec<String>,
+        /// Unsupported devices on the candidate port(s), root hubs excluded.
+        others: Vec<String>,
+    },
+}
+
+fn look<D>(
+    backends: &[Box<dyn UsbBoot>],
+    expected: Option<&Vec<u8>>,
+    node: u8,
+    devices: Vec<SeenDevice<D>>,
+) -> Look<D> {
+    let mut elsewhere = Vec::new();
+    let mut others = Vec::new();
+    let mut found = None;
+
+    for dev in devices {
+        let (vid, pid) = dev.vid_pid;
+        info!("trying {:#06x}:{:#06x}", vid, pid);
+        let backend = backends.iter().position(|b| b.is_supported(&dev.vid_pid));
+        let on_port = expected.map_or(true, |e| dev.ports == *e);
+        match backend {
+            Some(idx) if on_port => {
+                if found.is_none() {
+                    info!("ID {:#06x}:{:#06x} {}", vid, pid, backends[idx]);
+                    found = Some((dev, idx));
+                }
+            }
+            Some(idx) => {
+                // PORTS, not the bus. The bus a device lands on is decided by
+                // its SPEED, not by where it is plugged in: this board pairs
+                // an OHCI and an EHCI controller as companions for the same
+                // physical ports, so a full-speed device appears on bus 1 and
+                // a high-speed one on bus 2 -- at the same port, on the same
+                // hub. A Rockchip in maskrom is high-speed, so pinning the bus
+                // to 1 refused every node it was asked to flash. The port
+                // chain says which module this is; the bus says nothing.
+                warn!(
+                    "ignoring {} on {}: node {} is on port {}",
+                    backends[idx],
+                    dev.handle,
+                    node,
+                    expected
+                        .map(|e| UsbPortPath::describe_ports(e))
+                        .unwrap_or_default()
+                );
+                elsewhere.push(format!("{} on {}", backends[idx], dev.handle));
+            }
+            None if on_port && vid != 0x1d6b => {
+                let s = format!("{vid:04x}:{pid:04x}");
+                if !others.contains(&s) {
+                    others.push(s);
+                }
+            }
+            None => {}
+        }
+    }
+
+    match found {
+        Some((dev, idx)) => Look::Found(dev, idx),
+        None => Look::Missing { elsewhere, others },
+    }
+}
+
+/// Look at the bus every `interval` until a supported device is on the node's
+/// port, or `wait` has passed. Dropping the future cancels the wait.
+pub(crate) async fn wait_for_device<D>(
+    backends: &[Box<dyn UsbBoot>],
+    expected: Option<Vec<u8>>,
+    node: u8,
+    wait: Duration,
+    interval: Duration,
+    mut enumerate: impl FnMut() -> Result<Vec<SeenDevice<D>>, UsbBootError>,
+) -> Result<(D, usize), UsbBootError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut others: Vec<String> = Vec::new();
+    let mut elsewhere: Vec<String>;
+
+    loop {
+        match look(backends, expected.as_ref(), node, enumerate()?) {
+            Look::Found(dev, idx) => return Ok((dev.device, idx)),
+            Look::Missing {
+                elsewhere: e,
+                others: o,
+            } => {
+                for x in o {
+                    if !others.contains(&x) {
+                        others.push(x);
+                    }
+                }
+                elsewhere = e;
+            }
+        }
+        if tokio::time::Instant::now() + interval > deadline {
+            break;
+        }
+        tokio::time::sleep(interval).await;
+    }
+
+    Err(match &expected {
+        Some(e) if !elsewhere.is_empty() => UsbBootError::WrongPort {
+            node,
+            port: UsbPortPath::describe_ports(e),
+            found: elsewhere.join(", "),
+        },
+        _ => UsbBootError::BootDeviceTimeout { node, others },
+    })
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct Fake(Vec<(u16, u16)>);
+    impl Display for Fake {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Fake")
+        }
+    }
+    #[async_trait]
+    impl UsbBoot for Fake {
+        fn is_supported(&self, v: &(u16, u16)) -> bool {
+            self.0.contains(v)
+        }
+    }
+
+    fn backends() -> Vec<Box<dyn UsbBoot>> {
+        vec![Box::new(Fake(vec![(0x2207, 0x350b), (0x0a5c, 0x2711)]))]
+    }
+
+    fn dev(vid: u16, pid: u16, ports: &[u8]) -> SeenDevice<u8> {
+        SeenDevice {
+            vid_pid: (vid, pid),
+            ports: ports.to_vec(),
+            handle: UsbPortPath {
+                bus: 1,
+                ports: ports.to_vec(),
+            },
+            device: 7,
+        }
+    }
+
+    const FAST: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn found_on_third_poll() {
+        let n = Cell::new(0);
+        let r = wait_for_device(&backends(), None, 1, Duration::from_secs(5), FAST, || {
+            n.set(n.get() + 1);
+            Ok(if n.get() < 3 {
+                vec![dev(0x1d6b, 2, &[])]
+            } else {
+                vec![dev(0x2207, 0x350b, &[1])]
+            })
+        })
+        .await;
+        assert_eq!(r.unwrap(), (7, 0));
+        assert_eq!(n.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn never_appears_names_other_device() {
+        let e = wait_for_device(
+            &backends(),
+            None,
+            2,
+            Duration::from_millis(20),
+            FAST,
+            || Ok(vec![dev(0x1d6b, 2, &[]), dev(0x1a86, 0x7523, &[1, 2])]),
+        )
+        .await
+        .unwrap_err();
+        let m = e.to_string();
+        assert_eq!(
+            m,
+            "node 2: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+             did not appear within 15 s; other USB devices present: 1a86:7523. A device in the \
+             node's mini-PCIe slot (nodes 1 and 2) can share the USB lines used for flashing; \
+             remove it and retry"
+        );
+        assert!(!m.contains("1d6b"));
+    }
+
+    #[tokio::test]
+    async fn nothing_at_all_is_short() {
+        let e = wait_for_device::<u8>(&backends(), None, 3, Duration::from_millis(5), FAST, || {
+            Ok(vec![dev(0x1d6b, 1, &[])])
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "node 3: the module's USB boot device (Rockchip 2207:350b or Raspberry Pi 0a5c:2711) \
+             did not appear within 15 s"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_filter_respected() {
+        // A supported device on another port is not accepted; an unrelated
+        // device on another port is not blamed.
+        let e = wait_for_device(
+            &backends(),
+            Some(vec![2]),
+            2,
+            Duration::from_millis(5),
+            FAST,
+            || Ok(vec![dev(0x2207, 0x350b, &[1]), dev(0x1a86, 0x7523, &[3])]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, UsbBootError::WrongPort { node: 2, .. }), "{e}");
+
+        let e = wait_for_device(
+            &backends(),
+            Some(vec![2]),
+            2,
+            Duration::from_millis(5),
+            FAST,
+            || Ok(vec![dev(0x1a86, 0x7523, &[3]), dev(0x1a86, 0x7523, &[2])]),
+        )
+        .await
+        .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("present: 1a86:7523."), "{m}");
+
+        let ok = wait_for_device(
+            &backends(),
+            Some(vec![2]),
+            2,
+            Duration::from_millis(5),
+            FAST,
+            || Ok(vec![dev(0x2207, 0x350b, &[2])]),
+        )
+        .await;
+        assert!(ok.is_ok());
     }
 }

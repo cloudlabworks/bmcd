@@ -10,6 +10,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.40.0] — 2026-10-15
+
+### Changed
+
+- **Flashing waits up to 15 s for the module's USB boot device, and names
+  what is in the way when it does not appear.** It used to look at the bus
+  once, a second after power-on, and give up with "Compute module's USB
+  interface not found or supported". A module that enumerates slowly, or that
+  fails high-speed enumeration and is retried by the kernel, was refused for
+  that. It now looks every 250 ms. If nothing turns up the error says so for
+  the node (numbered as users see it) and lists the other USB devices seen on
+  the node's lines, root hubs excluded, with a hint that a device in the
+  mini-PCIe slot of nodes 1 and 2 shares the USB pair used for flashing. On a
+  board with a fanout hub a supported device on the wrong port is still
+  reported as such. Found from a user report on Discord, where a Zigbee
+  stick (`1a86:7523`) in node 2's slot kept an RK1 from enumerating.
+
 ## [2.39.0] — 2026-10-15
 
 ### Added
