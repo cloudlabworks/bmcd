@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, trace};
 
 use super::cooling_device::{
@@ -452,7 +453,10 @@ impl BmcApplication {
 
         self.reboot_into_usb(node, UsbConfig::Flashing(node, UsbRoute::Bmc))
             .await?;
-        let blk_dev = self.node_drivers.load_as_block_device(node).await?;
+        let blk_dev = self
+            .node_drivers
+            .load_as_block_device(node, &CancellationToken::new())
+            .await?;
 
         if let Err(e) = append_msd_config_to_usb_gadget(&blk_dev).await {
             tracing::error!("msd usb-gadget: {:#}", e);
@@ -467,10 +471,11 @@ impl BmcApplication {
         &self,
         node: NodeId,
         router: UsbRoute,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<impl 'static + AsyncRead + AsyncWrite + AsyncSeek + Unpin> {
         self.reboot_into_usb(node, UsbConfig::Flashing(node, router))
             .await?;
-        Ok(self.node_drivers.load_as_stream(node).await?)
+        Ok(self.node_drivers.load_as_stream(node, cancel).await?)
     }
 
     async fn reboot_into_usb(&self, node: NodeId, config: UsbConfig) -> anyhow::Result<()> {
