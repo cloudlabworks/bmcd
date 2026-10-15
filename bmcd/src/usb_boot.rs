@@ -263,7 +263,7 @@ fn look<D>(
         let (vid, pid) = dev.vid_pid;
         info!("trying {:#06x}:{:#06x}", vid, pid);
         let backend = backends.iter().position(|b| b.is_supported(&dev.vid_pid));
-        let on_port = expected.map_or(true, |e| dev.ports == *e);
+        let on_port = expected.is_none_or(|e| dev.ports == *e);
         match backend {
             Some(idx) if on_port => {
                 if found.is_none() {
