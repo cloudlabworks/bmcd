@@ -10,6 +10,279 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.43.0] — 2026-11-14
+
+Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
+
+### Added
+
+- **A shared console device per node for tools on the BMC: `/dev/ttyNode1` to
+  `/dev/ttyNode4`.** `microcom` or `picocom` on `/dev/ttyS1` read the same UART
+  as the daemon, so every character went to one reader or the other and a line
+  came out split between the terminal and the web console. The daemon now makes
+  a pseudo-terminal for each node when it starts, with a stable symlink to it,
+  and puts everything the node sends on it as well as in the web console. What
+  is typed in a terminal on the device reaches the node, as typing in the web
+  console does, so both show the same thing. Open `/dev/ttyNodeN` instead of
+  `/dev/ttyS*`; the daemon's lock on the `ttyS*` ports stays, and means just
+  that. A terminal program's own speed setting has no effect on it: the speed
+  is the node's `uart_baud` setting. Nobody has to be reading: output that
+  nobody takes is dropped and never holds up the node's other readers.
+  One line per node in the log says where the device is.
+
+### Fixed
+
+- **The serial speed of a node was stored and never used.** `uart_baud` in a
+  node's settings was kept and shown but every port was opened at 115200
+  whatever it said. The port now opens at the stored speed (115200 when there
+  is none) and follows a change as soon as it is made, without restarting the
+  daemon or disconnecting the web console. A value that is not a standard rate
+  (300 to 3000000, which includes 1500000) is now refused with a `400` that
+  names the node and the rates, and nothing in that request is changed.
+  `GET /api/bmc/nodes` shows it as `uart_baud`, `null` for the default.
+- **`tpi about` showed `board ����` on a board whose information EEPROM was
+  never programmed.** The serial number was already cleaned of padding; the
+  model name was not, nor the hardware revision, which read as `v31.31.63` on
+  an erased EEPROM. Both are now empty, as they are when the EEPROM cannot be
+  read, and text that is noise in the middle is not shown either.
+
+## [2.42.2] — 2026-11-01
+
+### Fixed
+
+- **A board with no SD card (or a card with no `firmware` folder) kept
+  retrying the whole firmware check every two minutes and showed a warning
+  for it.** The `SD card` source answered "`/mnt/sdcard/firmware` is not a
+  directory" as an error, and any source error shortens the catalogue's cache
+  from 30 minutes to 2 minutes and keeps it off the overlay, so a card-less
+  board never kept a good catalogue across a reboot and the firmware page
+  carried "SD card: This source returned nothing usable" for ever. A source
+  on the card now reports nothing, and no error, when the card is not
+  mounted (decided as `os_park` and the staging code decide it: the mount
+  point has a different device from its parent) or when the card has no
+  `firmware` folder. A card that is there and unreadable (`firmware` is a
+  file, the folder will not open) is still an error, and so is a missing
+  folder for a local source configured away from the card. So is a card the
+  kernel sees (`/dev/mmcblk0`) that nothing has mounted, which now says "an SD
+  card is inserted but not mounted (unsupported or damaged filesystem?)". A
+  mount point that cannot be inspected at all is an error too, not "no card".
+  The response shape is unchanged.
+- **The message for parking an image with no card said "Insert one, or upload
+  without parking", which is a dead end in the web interface.** It now says
+  the image was not saved because no SD card is mounted (or, when the kernel
+  sees a card that nothing mounted, that it is inserted but not mounted), and
+  that installing directly is `tpi firmware upload` without `--park` or the
+  interface's install option.
+- **An image parked on the card did not appear in the catalogue for up to 30
+  minutes.** A successful park now marks the cached catalogue stale, so the
+  next `GET /firmware/available` starts a refresh. A fan-out already
+  running when the park finishes cannot clear the mark, since it may have
+  read the card before the image was there.
+- **One hung firmware source discarded every other source's answer.** The
+  catalogue refresh waited for all sources and was cut off as a whole after
+  10 minutes, so a source that hung (a stuck `curl` under
+  `tpi-selfupdate --list`) cost the fast sources their results too: nothing
+  was cached or persisted and the page kept the old listing. Each source now
+  has its own 360 s deadline (the slowest fan-out on record is bmc-2 on
+  2026-09-12, about 230 s). A source that overruns reports
+  `timed out after 360 s` as its own error, and the others are cached and
+  persisted as usual. The updater runs in its own process group; on the
+  deadline the whole group (the script and its `curl`) is killed while the
+  script is still unreaped, so hung downloads do not pile up on the board,
+  and output is read until both pipes close or the deadline, so a `curl` that
+  outlives its script cannot hold the check up either. A source whose
+  blocking call never returned (a wedged read of a failing card) is skipped
+  on the next check with "still busy from the previous check", rather than
+  leaving another thread behind each time. When the only errors are such
+  slow sources, or a card that is inserted but not mounted (which a retry in
+  two minutes will not change), the retry waits 15 minutes instead of 2, so a
+  slow but working board does not start its `curl`-heavy listings every few
+  minutes against GitHub's 60 requests an hour. The 10-minute limit on the refresh as
+  a whole stays as the outer guard.
+- **Concurrent requests with nothing cached each started their own firmware
+  check, and a park that landed as a check finished could go unnoticed.** A
+  request that finds the catalogue empty now waits for the one refresh (it
+  does not start another), and answers when it completes as before; if
+  nothing arrives within 10 minutes it answers an empty list with
+  `refreshing: true`. The stale mark and the check's result are now decided
+  under the same lock.
+- **`GET /api/bmc/info` (and `opt=get&type=info`) says whether an SD card is
+  mounted.** The `SD card` entry in `storage` gains `mounted`, decided by the
+  same mount-point test the park and staging code use (a mount point that
+  cannot be inspected reads as not mounted). Before, a client could
+  only guess, by noticing that the entry's sizes equalled the BMC's (`statvfs`
+  on the empty `/mnt/sdcard` answers for the volume underneath). Additive: the
+  `BMC` entry has no `mounted`, the `SD card` entry is present under the same
+  rule as before, and its sizes are reported as before, so an older interface
+  is unaffected. The sizes are not a statement about a card while `mounted` is
+  false; read the new field instead.
+
+## [2.42.1] — 2026-10-31
+
+### Fixed
+
+- **The settings-storage repair was never offered on a real board: the root
+  device shows as `/dev/root`, which 2.42.0 did not resolve.** On the board
+  the kernel mounts the read-only image itself, so `/proc/mounts` says
+  `/dev/root /mnt/rom erofs ...` and `/dev/root` is not a device node.
+  `GET /api/bmc/storage` therefore reported `backing: "unknown"`, and with it
+  `repairable: false`, even on a board that had lost its settings. When the
+  mount source of the read-only root is `/dev/root` (or is not a device node
+  at all, as for a root that is the overlay), the kernel's own `root=` from
+  `/proc/cmdline` is resolved instead: a `MAJOR:MINOR` such as `254:0` through
+  `/sys/class/block/*/dev` (which names it `ubiblock0_1`), or a `/dev/<name>`
+  as it stands. `ubiblock*` is `ubi` and `mmcblk*` is `mmc`, as before.
+  Whatever cannot be resolved (`PARTUUID=`, `PARTLABEL=`, a device sysfs does
+  not list, no `root=`) stays `unknown`, and an unknown backing still does not
+  offer the repair.
+
+## [2.42.0] — 2026-10-31
+
+When the settings volume (the UBI volume `overlay`, mounted at
+`/mnt/overlay`) cannot be mounted, `/sbin/preinit` does not stop: it boots on
+a writable layer in RAM (`/tmp/safemode`). Every reboot is then a factory
+reset (password `turing`, a new certificate) and nothing says so. The same
+layer is used on purpose when KEY1 is held at power-on. A user hit it with a
+volume that would not mount (a UBIFS journal that would not replay); what
+fixed it was removing the volume with `ubirmvol /dev/ubi0 -N overlay` and
+rebooting, so that preinit recreated it. A mount failure can be transient, so
+a plain reboot is the first thing to try; removing the volume is for when it
+fails again.
+
+### Added
+
+- **`GET /api/bmc/storage` says whether the board is keeping its settings.**
+  It answers `{state, reason, detail, backing, repairable, repair_blocker}`.
+  `state` is `persistent`, `temporary` or `unknown`, and it comes from
+  `/proc/mounts`, which is the authority: `temporary` is an overlay on `/`
+  whose upper directory is under `/tmp/safemode/`, `persistent` is an overlay
+  with any other upper directory (normally `/mnt/overlay/upper`). `reason`,
+  only when `temporary`, is `requested` (KEY1), `mount_failed`, or
+  `unrecorded`. Firmware 2.46.0 and later write the reason to
+  `/etc/safemode.reason` (line 1 `reason=...`, the rest free text, which is
+  returned as `detail`, trimmed and cut to 8 KiB). KEY1 always wins: if the
+  kernel command line contains `safemode` (a substring match, as preinit
+  tests it), the reason is `requested` whatever the file says. Otherwise it
+  is the file's, and when the file is missing or unreadable (older firmware),
+  `unrecorded`. `backing` is
+  `ubi` (the built-in flash), `mmc` (the SD card) or `unknown`, from the
+  device under the read-only root.
+- **`POST /api/bmc/storage/repair` removes the settings volume and reboots.**
+  The body must be `{"confirm": true}` sent as `Content-Type:
+  application/json` (400 without the confirmation, 415 for any other content
+  type, which also stops a page on another origin from triggering it with a
+  form). It runs `ubirmvol /dev/ubi0 -N overlay` (60 s at most) and answers
+  202 `{"rebooting": true}`; about two seconds later it reboots the BMC the
+  way `tpi reboot` does, and preinit creates a fresh volume on the way up.
+  The removal and the reboot are one detached piece of work: a client that
+  disconnects while `ubirmvol` runs does not leave a board with its volume
+  gone and no reboot to recreate it. **This permanently erases what is on the
+  volume**: network configuration, certificates, node names, application
+  data. It is not being loaded now, but it cannot be recovered afterwards.
+  Try a plain reboot first, since a mount failure can be transient. **It
+  also reboots the BMC, which on a v2.4 board power-cycles the four compute
+  modules.** The board comes back as a factory unit: password `turing`, a
+  new certificate. Same authentication as the other mutating endpoints.
+- **Repair is offered only where it is safe, and decided again on every
+  request.** `repairable` is true only when the state is `temporary`, the
+  reason is `mount_failed` or `unrecorded`, the backing is `ubi`, a volume
+  named exactly `overlay` exists under `ubi0`, and nothing is mounted at
+  `/mnt/overlay`. Otherwise `repair_blocker` says why in a sentence (KEY1 was
+  held: reboot without it to use the saved settings; the settings are on the
+  SD card; there is no volume to remove: reboot the BMC to recreate it), and
+  `POST` answers 409 with the same sentence and runs nothing. A failed or
+  timed-out `ubirmvol` is a 500 with what it printed, and nothing is
+  rebooted. A second request while one is under way is refused; a refused
+  request never counts as one.
+- **The two storage endpoints answer on a board still on its factory password.**
+  Everything else is still refused with 403 there. A board that could not
+  mount its settings volume is always on the factory password, because every
+  reboot is a factory reset, so the page that has to tell its owner so is the
+  one the gate shows; making them set a password first would have them set
+  one that is lost at the next reboot. `GET /api/bmc/storage` and `POST
+  /api/bmc/storage/repair` (each for its own method only) are therefore let
+  through the gate. They are still authenticated, and the repair is still
+  refused with 409 unless the board's own facts say it is on offer. This
+  opens nothing new: the stock firmware's sshd has `PermitRootLogin yes` and
+  `PasswordAuthentication yes`, so `root` / `turing` already gives a root
+  shell, and from it `ubirmvol`. If SSH is ever hardened, this exemption must
+  be revisited.
+- **The log says it at startup.** One warning when the board is on the
+  temporary layer, with the reason, so it is in the log even if nobody opens
+  the interface.
+
+## [2.41.0] — 2026-10-31
+
+The network page assumed the board's only bridge is `br0`. A user report on
+Discord came from a board whose `/etc/network/interfaces` was split by hand
+into `br-wan` (on ge0) and `br-lan` (on ge1), with no `br0`: the page showed
+no address, every change failed with a 500, and `tpi info` printed "Unknown"
+for the IP.
+
+### Changed
+
+- **The board's address is read from the primary interface, not from `br0`.**
+  The primary interface is `br0` when it exists and has a global IPv4
+  address (so a USB modem or a VPN holding the default route does not take the
+  page away from the bridge it manages); otherwise the device of the IPv4
+  default route, or, with no default route, the first up non-loopback
+  interface with a global IPv4 address. Its address is the first global, non-alias one (a `br0:1` alias or
+  a secondary address never wins over the main one). `GET
+  /api/bmc/network/address` now reports it as `live.address` with the device
+  name in the new `live.interface`, plus `interfaces`: every up, non-loopback
+  interface with a global IPv4 address as `{name, addresses, mac,
+  default_route}`, the default route's first. `tpi info` (and
+  `/api/bmc?opt=info`) use the same interface for `ip` and `mac`, and fall
+  back to the kernel's address list (as before) if `ip` is missing or the
+  board has no global address yet. One reading of `ip` serves a whole `GET`,
+  taken off the web workers.
+- **`PUT /api/bmc/network/address` answers 409 when there is no `br0`.** The
+  message lists what the board has ("This board has no br0 bridge (it has:
+  br-wan, br-lan). ..."). Nothing is changed: no pending change, no
+  `last_revert`. The view says so beforehand with `managed_interface` (`br0`)
+  and `managed_interface_present`. The switch's apply and validate endpoints
+  and the network restart (`ifdown br0 && ifup br0`) answer 409 the same way
+  instead of failing one command at a time.
+- **A hand-written `/etc/network/interfaces` is not replaced unless the
+  request says so.** `PUT` answers 409 unless the body carries
+  `"replace_hand_written": true`, for a file the daemon did not write
+  (readable or not). The image's own default file counts as the daemon's: it
+  is replaced without ceremony.
+- **Other failures keep their 500, but the body is the daemon's own message**
+  (the command that failed and what it printed), without the doubled "Failed
+  to ..." wrapper, in the usual `{"response":[{"result": ...}]}` shape.
+- **`last_revert` records why.** It gains `detail`, the error text of a
+  failed apply (a plain sentence for a revert that was requested or not
+  confirmed). It is cleared by a later successful apply and by a confirm; a
+  failed apply used to stay in the view until the daemon restarted.
+- **The `interfaces` file is read again when it changes.** The view re-reads
+  and re-parses it whenever its modification time differs from the last read,
+  and recomputes `file` and `configured`, so a file restored by hand over SSH
+  is noticed without restarting the daemon. A change made between an apply and
+  its confirmation is noticed at the confirmation.
+
+### Fixed
+
+- **A confirmed address change used to overwrite a hand-edited
+  `/etc/network/interfaces` without keeping a copy.** Confirming rewrote the
+  whole file with only `lo` and `br0`, so any other stanza (a second bridge,
+  a VLAN, a `post-up` hook) was lost for good, and a file that could not be
+  read was replaced just the same. Whenever the file was not written by the
+  daemon, confirm now first copies it, byte for byte, to
+  `/etc/network/interfaces.hand-written.<unix seconds>` in the same directory
+  (a `-1`, `-2`, ... suffix if that name is taken, as on a board with no
+  clock) and reports the path as `file_backup`. The newest five copies are
+  kept. If the copy cannot be made, the file is not touched. The image's own
+  default file is not kept: it is nobody's work.
+- **A confirm whose file write failed no longer pretends it succeeded.** The
+  copy and the write now happen before the change is committed, so a full or
+  read-only overlay leaves the change pending (confirm it again, or the window
+  puts the old address back) instead of leaving the new address live with
+  nothing pending and a file that still says the old one.
+- **An `interfaces` file that is not valid UTF-8, or cannot be read, is
+  treated as hand-written.** It used to read as "no file", i.e. DHCP, and was
+  replaced without the opt-in.
+
 ## [2.40.0] — 2026-10-15
 
 ### Changed

@@ -27,6 +27,8 @@ use actix_web::{
 use bytes::BytesMut;
 type Query = web::Query<std::collections::HashMap<String, String>>;
 
+pub mod baud;
+pub mod console_pty;
 pub mod serial;
 pub mod serial_handler;
 mod serial_websocket;

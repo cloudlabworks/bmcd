@@ -57,7 +57,7 @@ on the `(type, is_set)` pair. A missing `opt` or `type` is a 400, and so is a
 | `firmware_slots` | running and rollback firmware volumes, staged update, last promotion (*this fork*) |
 | `health` | BMC uptime, load, memory, NAND wear and clock synchronisation (*this fork*) |
 | `info` | IP addresses and storage |
-| `node_info` | per-node auxiliary info |
+| `node_info` | per-node name, module name, power-on time and serial console speed (`uart_baud`, `null` = 115200) |
 | `nodeinfo` | hard-coded zeros; there is no implementation behind it |
 | `network` | link state, speed, duplex and counters of the six switch ports (*this fork*) |
 | `other` | the deprecated duplicate of `about` |
@@ -99,6 +99,45 @@ sit `GET /api/bmc/backup` (a tar of `/mnt/overlay/upper`),
 There is no `GET /api/bmc/info`: it answers 401 unauthenticated, which makes it
 look like a route, and once authenticated it falls through to the SPA and
 returns `index.html`.
+
+### A node's serial console, from the web and from the BMC itself
+
+Each node's UART is read by the daemon alone. The web console and the legacy
+`uart` calls share what it reads, and so does every local tool on the BMC
+through one **console device per node**: `/dev/ttyNode1` to `/dev/ttyNode4`
+(the number printed on the board), each a symlink to a pseudo-terminal that the
+daemon creates at start and replaces at the next start.
+
+```sh
+microcom -s 1500000 /dev/ttyNode1    # or: picocom /dev/ttyNode1
+```
+
+Open these, not `/dev/ttyS1` to `/dev/ttyS4`. Two programs reading one UART
+each get part of what arrives, which is why characters used to be split between
+a terminal and the web console. The daemon holds a shared lock on the `ttyS*`
+ports, so `picocom` refuses them (`cannot lock`) and says so; that is the lock
+meaning "use `/dev/ttyNodeN`".
+
+* What the node sends appears on the console device, and in the web console.
+  What is typed on either side reaches the node. The device is in raw mode: no
+  echo of its own (the node echoes), no `\n` to `\r\n` translation.
+* **The speed is a node setting, not a terminal setting.** A baud rate chosen
+  by `microcom -s` or `picocom -b` is accepted and has no effect, because the
+  console device is not the port. The speed of the port is `uart_baud` in the
+  node's settings: 115200 when unset, applied at start and as soon as it is
+  changed, without disconnecting the web console.
+  `POST /api/bmc?opt=set&type=node_info` with `{"Node2": {"uart_baud": 1500000}}`
+  sets it; `GET /api/bmc/nodes` (or `opt=get&type=node_info`) shows it. The
+  rates are the standard Linux ones from 300 up to 3000000; anything else is a
+  `400` naming the node and listing them.
+* **Nobody has to be reading.** The daemon never waits for a tool: output that
+  the pseudo-terminal cannot hold is dropped, so a device nobody opened costs a
+  bounded amount of kernel memory, and a tool that is slower than the node loses
+  output rather than slowing the node's other readers. A tool that opens the
+  device after the node has been quiet may first see up to one buffer of recent
+  output, which is not a history.
+* The firmware must mount `devpts` and provide `/dev/ptmx`, which the stock
+  images do.
 
 ### Four operations take a JSON body, and must
 

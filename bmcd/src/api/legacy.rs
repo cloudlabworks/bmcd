@@ -16,9 +16,7 @@ use crate::api::into_legacy_response::LegacyResponse;
 use crate::api::into_legacy_response::{LegacyResult, Null};
 use crate::app::bmc_application::NodeInfo;
 use crate::app::bmc_application::{BmcApplication, UsbConfig};
-use crate::app::bmc_info::{
-    get_fs_stat, get_ipv4_address, get_mac_address, get_net_interfaces, get_storage_info,
-};
+use crate::app::bmc_info::{get_fs_stat, get_net_interfaces, get_primary_info, get_storage_info};
 use crate::app::firmware_catalog;
 use crate::app::firmware_info::get_firmware_slots;
 use crate::app::firmware_sources;
@@ -267,7 +265,7 @@ async fn dispatch_inner(
         ("firmware_slots", false) => get_firmware_slot_info().await.into(),
         ("health", false) => get_health_info().await.into(),
         ("network", false) => get_network_info().await.into(),
-        ("network", true) => reset_network(bmc).await.into(),
+        ("network", true) => reset_network(bmc).await,
         ("nodeinfo", true) => set_node_info().into(),
         ("nodeinfo", false) => get_node_info(bmc).into(),
         ("node_info", false) => get_node_aux_info(bmc).await.into(),
@@ -708,8 +706,17 @@ fn clear_usb_boot(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
     bmc.clear_usb_boot().context("clear USB boot mode")
 }
 
-async fn reset_network(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    bmc.rtl_reset().await.context("reset network switch")
+async fn reset_network(bmc: &BmcApplication) -> LegacyResponse {
+    // Restarting br0 on a board that has none would run `ifdown` on nothing
+    // and report a failure nobody can act on. Say what is wrong instead.
+    let applier = crate::app::address_applier::Applier::system();
+    if let Some(message) = applier.missing_message(
+        "The network restart brings br0 down and up; there is nothing to restart here. Edit \
+         /etc/network/interfaces over SSH, or restore the default layout.",
+    ) {
+        return LegacyResponse::Error(StatusCode::CONFLICT, message.into());
+    }
+    bmc.rtl_reset().await.context("reset network switch").into()
 }
 
 fn set_node_info() -> impl Into<LegacyResponse> {
@@ -819,8 +826,12 @@ async fn read_hostname() -> io::Result<String> {
 /// 50-byte header, so this is one more `value_of` and not a second reader.
 pub(crate) async fn read_board_info() -> io::Result<(String, String, Option<String>)> {
     let info = ::board_info::BoardInfo::load()?;
-    let board_model = info.value_of(&BoardInfoAttribute::ProductName);
-    let board_revision = info.value_of(&BoardInfoAttribute::HwVersion);
+    // The model and the revision are strings in the answer, empty when the
+    // EEPROM has nothing readable in them, as for a board that cannot be read
+    // at all. The serial can be told apart, so it is `None`.
+    let board_model =
+        trim_eeprom_field(info.value_of(&BoardInfoAttribute::ProductName)).unwrap_or_default();
+    let board_revision = clean_board_revision(info.value_of(&BoardInfoAttribute::HwVersion));
     let board_serial = trim_eeprom_field(info.value_of(&BoardInfoAttribute::FactorySerial));
     Ok((board_model, board_revision, board_serial))
 }
@@ -831,16 +842,35 @@ pub(crate) async fn read_board_info() -> io::Result<(String, String, Option<Stri
 /// characters. A field with nothing left after that is `None`: a board whose
 /// EEPROM was never programmed should say it has no serial, not report a
 /// string of padding as one.
+///
+/// The field is text up to its first NUL, as a C string is. What is left must
+/// be printable: bytes that decode to replacement or control characters in the
+/// middle of the text mean the field is not text at all (a half-programmed or
+/// corrupted EEPROM), and showing them is showing noise.
 fn trim_eeprom_field(value: String) -> Option<String> {
-    let trimmed = value.trim_matches(|c: char| c == '\0' || c == '\u{fffd}' || c.is_whitespace());
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    let text = value.split('\0').next().unwrap_or_default();
+    let trimmed = text.trim_matches(|c: char| c == '\u{fffd}' || c.is_whitespace());
+    let readable =
+        !trimmed.is_empty() && !trimmed.chars().any(|c| c == '\u{fffd}' || c.is_control());
+    readable.then(|| trimmed.to_string())
+}
+
+/// What `board_info` makes of a hardware version that was never written: the
+/// version is 16 bits, `v<5 bits>.<5 bits>.<6 bits>`, so an erased EEPROM
+/// (all 0xff) reads as the largest version there is and a zeroed one as
+/// `v0.0.0`. Neither is a revision a board has.
+fn clean_board_revision(revision: String) -> String {
+    match revision.as_str() {
+        "v31.31.63" | "v0.0.0" => String::new(),
+        _ => revision,
+    }
 }
 
 /// function is here for backwards compliance. Data is mostly a duplication of [`get_about`]
 async fn get_system_information() -> impl Into<LegacyResponse> {
     let build_time = build_time::build_time_utc!("%Y-%m-%d %H:%M:%S-00:00");
-    let ipv4 = get_ipv4_address().unwrap_or("Unknown".to_owned());
-    let mac = get_mac_address("br0").await;
+    let (ipv4, mac) = get_primary_info().await;
+    let ipv4 = ipv4.unwrap_or("Unknown".to_owned());
 
     let mut info = json!(
         {
@@ -1197,7 +1227,7 @@ fn flag(query: &Query, name: &str) -> LegacyResult<bool> {
 
 async fn create_data_transfer(query: &Query) -> LegacyResult<DataTransfer> {
     let root = Path::new(crate::app::sdcard_files::SDCARD_ROOT);
-    let mounted = crate::app::upgrade_worker::is_mount_point(root);
+    let mounted = crate::app::upgrade_worker::is_mounted_or_false(root);
     create_data_transfer_in(query, root, mounted).await
 }
 
@@ -1653,6 +1683,39 @@ mod test {
         assert_eq!(trim_eeprom_field("\u{fffd}".repeat(16)), None);
     }
 
+    #[test]
+    fn an_unprogrammed_eeprom_has_no_model_and_no_revision() {
+        // 16 bytes of 0xff, as `from_utf8_lossy` hands them over: what
+        // `tpi about` showed as `board ����`.
+        let erased = String::from_utf8_lossy(&[0xffu8; 16]).to_string();
+        assert_eq!(trim_eeprom_field(erased), None);
+        // 0xffff in the version field
+        assert_eq!(clean_board_revision("v31.31.63".to_string()), "");
+        assert_eq!(clean_board_revision("v0.0.0".to_string()), "");
+        assert_eq!(clean_board_revision("v2.5.2".to_string()), "v2.5.2");
+    }
+
+    #[test]
+    fn a_model_is_text_up_to_its_first_nul() {
+        assert_eq!(
+            trim_eeprom_field("Turing Pi 2\0\0\0\0\0".to_string()),
+            Some("Turing Pi 2".to_string())
+        );
+        // padding that is not NUL is trimmed too
+        assert_eq!(
+            trim_eeprom_field("  TuringPi2 \u{fffd}\u{fffd}".to_string()),
+            Some("TuringPi2".to_string())
+        );
+        // bytes left behind after the text are not part of it
+        assert_eq!(
+            trim_eeprom_field("TuringPi2\0\u{fffd}\u{fffd}".to_string()),
+            Some("TuringPi2".to_string())
+        );
+        // noise inside the text: not a name
+        assert_eq!(trim_eeprom_field("Tur\u{fffd}ng".to_string()), None);
+        assert_eq!(trim_eeprom_field("Tur\x07ng".to_string()), None);
+    }
+
     use crate::app::firmware_info::{FirmwareSlots, Promotion, Slot, StagedImage};
 
     /// The exact bytes `opt=get&type=firmware_slots` puts on the wire for the
@@ -1901,12 +1964,17 @@ mod test {
                 "Node1": {
                     "module_name": "Raspberry Pi CM4"
                 },
+                "Node2": {
+                    "uart_baud": 1500000
+                },
                 "Node3": {
                     "name": "New jeston"
                 }
             }
         };
-        let _: HashMap<NodeId, NodeInfo> = serde_json::from_value(json).unwrap();
+        let infos: HashMap<NodeId, NodeInfo> = serde_json::from_value(json).unwrap();
+        assert_eq!(infos[&NodeId::Node2].uart_baud, Some(1_500_000));
+        assert_eq!(infos[&NodeId::Node1].uart_baud, None);
     }
 
     /// The exact bytes `opt=get&type=thermal` puts on the wire, for the board

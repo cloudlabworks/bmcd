@@ -16,6 +16,8 @@ use crate::hal::{NodeId, PinController, UsbMode, UsbRoute};
 use crate::hal::{PowerController, UsbArchitecture};
 use crate::persistency::app_persistency::ApplicationPersistency;
 use crate::persistency::app_persistency::PersistencyBuilder;
+use crate::serial_service::baud::{effective_baud, validate_baud, InvalidBaud};
+use crate::serial_service::serial::SerialConnections;
 use crate::usb_boot::NodeDrivers;
 use crate::utils::{self, get_timestamp_unix};
 use crate::{
@@ -30,6 +32,7 @@ use std::ffi::c_ulong;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -93,7 +96,43 @@ pub struct NodeInfo {
     pub name: Option<String>,
     pub module_name: Option<String>,
     pub power_on_time: Option<u64>,
+    /// The speed of the node's serial console, in baud. `null` means the
+    /// default, 115200. One of 300, 600, 1200, 2400, 4800, 9600, 19200,
+    /// 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600,
+    /// 1000000, 1152000, 1500000, 2000000, 2500000 or 3000000; anything else
+    /// is refused with a 400. Takes effect at once on the open port, without
+    /// disconnecting the web console, and again at every start of the
+    /// daemon. Local tools on the BMC read the same console at
+    /// `/dev/ttyNode1` to `/dev/ttyNode4` and cannot change the speed
+    /// themselves.
     pub uart_baud: Option<u32>,
+}
+
+/// A node setting that cannot be accepted. A caller's mistake, answered as a
+/// 400: decided by this type and not by reading the message.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("node {node}: {source}")]
+pub struct NodeInfoRequestError {
+    /// The node, 1 to 4, as numbered on the board.
+    pub node: usize,
+    #[source]
+    pub source: InvalidBaud,
+}
+
+/// Checks every setting in a request before any of it is stored, so a
+/// request with one bad value changes nothing.
+fn validate_node_infos(infos: &HashMap<NodeId, NodeInfo>) -> Result<(), NodeInfoRequestError> {
+    let mut nodes: Vec<_> = infos.iter().collect();
+    nodes.sort_by_key(|(node, _)| **node as usize);
+    for (node, info) in nodes {
+        if let Some(baud) = info.uart_baud {
+            validate_baud(baud).map_err(|source| NodeInfoRequestError {
+                node: *node as usize + 1,
+                source,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Where the node power state applied on start of the daemon comes from.
@@ -156,6 +195,9 @@ pub struct BmcApplication {
     pub(super) power_controller: PowerController,
     pub(super) app_db: ApplicationPersistency,
     node_drivers: NodeDrivers,
+    /// The console ports, once they are open: a new serial speed is applied
+    /// to them as it is stored. Set once by [`Self::attach_serial`].
+    serial: OnceLock<Arc<SerialConnections>>,
 }
 
 impl BmcApplication {
@@ -184,6 +226,7 @@ impl BmcApplication {
             power_controller,
             app_db,
             node_drivers,
+            serial: OnceLock::new(),
         };
 
         instance.initialize().await?;
@@ -516,12 +559,27 @@ impl BmcApplication {
         Ok(())
     }
 
+    /// The serial speed of each node's console, as stored: what the ports are
+    /// opened at when the daemon starts. 115200 for a node with none.
+    pub async fn node_bauds(&self) -> [u32; 4] {
+        let stored = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        std::array::from_fn(|i| effective_baud(stored[i].uart_baud))
+    }
+
+    /// Hands over the console ports, so that a change of a node's serial
+    /// speed reaches the open port. Only the first call has an effect.
+    pub fn attach_serial(&self, serial: Arc<SerialConnections>) {
+        let _ = self.serial.set(serial);
+    }
+
     #[instrument(skip(self))]
     pub async fn set_node_info(&self, new_info: HashMap<NodeId, NodeInfo>) -> anyhow::Result<()> {
+        validate_node_infos(&new_info)?;
         let mut stored_nodes = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
 
-        for (i, info) in &mut new_info.into_iter().map(|(k, v)| (k as usize, v)) {
-            let store_node = &mut stored_nodes[i];
+        let mut new_bauds = Vec::new();
+        for (node, info) in new_info {
+            let store_node = &mut stored_nodes[node as usize];
 
             if let Some(name) = info.name {
                 store_node.name = Some(name);
@@ -533,12 +591,21 @@ impl BmcApplication {
 
             if let Some(uart_baud) = info.uart_baud {
                 store_node.uart_baud = Some(uart_baud);
+                new_bauds.push((node, uart_baud));
             }
         }
 
         self.app_db
             .set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
             .await;
+
+        // After it is stored, so that a speed that was applied is a speed
+        // that survives the next start.
+        if let Some(serial) = self.serial.get() {
+            for (node, baud) in new_bauds {
+                serial.set_baud_rate(node, baud);
+            }
+        }
 
         Ok(())
     }
@@ -609,6 +676,73 @@ impl BmcApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(entries: &[(NodeId, Option<u32>)]) -> HashMap<NodeId, NodeInfo> {
+        entries
+            .iter()
+            .map(|(node, uart_baud)| {
+                (
+                    *node,
+                    NodeInfo {
+                        uart_baud: *uart_baud,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_request_with_valid_or_no_speeds_is_accepted() {
+        assert_eq!(validate_node_infos(&request(&[])), Ok(()));
+        assert_eq!(
+            validate_node_infos(&request(&[
+                (NodeId::Node1, None),
+                (NodeId::Node2, Some(1_500_000))
+            ])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_bad_speed_is_refused_and_names_the_node() {
+        let err = validate_node_infos(&request(&[
+            (NodeId::Node1, Some(115_200)),
+            (NodeId::Node3, Some(12_345)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.node, 3);
+        assert_eq!(err.source, InvalidBaud(12_345));
+        assert!(err
+            .to_string()
+            .starts_with("node 3: 12345 is not a supported"));
+    }
+
+    #[test]
+    fn the_first_bad_node_is_the_one_reported() {
+        let err = validate_node_infos(&request(&[
+            (NodeId::Node4, Some(1)),
+            (NodeId::Node2, Some(2)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.node, 2);
+    }
+
+    #[test]
+    fn a_bad_speed_is_a_400_with_the_plain_message() {
+        let err = validate_node_infos(&request(&[(NodeId::Node1, Some(7))])).unwrap_err();
+        let response =
+            crate::api::into_legacy_response::LegacyResponse::from(anyhow::Error::from(err));
+        let crate::api::into_legacy_response::LegacyResponse::Error(status, message) = response
+        else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, actix_web::http::StatusCode::BAD_REQUEST);
+        assert!(
+            message.starts_with("node 1: 7 is not a supported serial speed"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn startup_adopts_live_state_when_any_node_is_on() {

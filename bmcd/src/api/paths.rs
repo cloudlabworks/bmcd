@@ -118,7 +118,7 @@ pub(crate) static ALIASES: &[Alias] = &[
         path: "/nodes",
         ty: "node_info",
         document_param: None,
-        summary: "Node names, module names and power-on times",
+        summary: "Node names, module names, power-on times and serial console speeds",
     },
     Alias {
         method: Method::Get,

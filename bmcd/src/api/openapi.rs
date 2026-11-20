@@ -340,6 +340,14 @@ fn access_paths() -> Vec<(String, Value)> {
         "description": "A refusal, RFC 9457.",
         "content": { "application/problem+json": { "schema": component_ref("Problem") } }
     });
+    // The legacy refusal: `{"response":[{"result":"<message>"}]}`.
+    let legacy_error = json!({
+        "type": "object",
+        "properties": { "response": { "type": "array", "items": {
+            "type": "object",
+            "properties": { "result": { "type": "string" } }
+        }}}
+    });
 
     vec![
         (
@@ -420,6 +428,8 @@ fn access_paths() -> Vec<(String, Value)> {
                     })}}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "409": { "description": "The board has no br0, the bridge over the switch ports. Nothing was changed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -505,6 +515,8 @@ fn access_paths() -> Vec<(String, Value)> {
                     })}}},
                     "responses": {
                         "200": { "description": "The verdict: document, refusal, warnings." },
+                        "409": { "description": "The board has no br0, the bridge over the switch ports, so there is nothing to validate against.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -521,7 +533,28 @@ fn access_paths() -> Vec<(String, Value)> {
                                     comes back to, what the bridge actually has right now, any \
                                     change still waiting to be confirmed, and the last revert \
                                     with its reason. `file` says whether the daemon wrote the \
-                                    file, a person did, or the daemon could not read it.",
+                                    file (`bmcd`), a person did (`hand_edited`), or the daemon \
+                                    could not read it (`unreadable`); the file is read again \
+                                    whenever its modification time changes, so a file restored \
+                                    by hand is noticed without a restart.\n\n\
+                                    `live` is the **primary interface**: the device of the \
+                                    IPv4 default route, or failing that the first up, \
+                                    non-loopback interface with a global IPv4 address. \
+                                    `live.interface` is its name (`br0` on a stock board, \
+                                    `br-wan` on one whose `interfaces` file was split by hand) \
+                                    and `live.address` its first global, non-alias address in \
+                                    CIDR form. `interfaces` lists every up, non-loopback \
+                                    interface with at least one global IPv4 address as \
+                                    `{name, addresses[], mac, default_route}`, the default \
+                                    route's first and the rest by name. \
+                                    `managed_interface` is `br0`, the only interface this page \
+                                    can change, and `managed_interface_present` says whether \
+                                    it exists: when it does not, `PUT` answers 409. \
+                                    `last_revert` is `{at, reason, detail, document}`, where \
+                                    `detail` is the error text of a failed apply; a later \
+                                    successful apply or a confirm clears it. `file_backup` is \
+                                    the path of the copy a confirmed change made of a \
+                                    hand-written file, or `null`.",
                     "responses": {
                         "200": { "description": "The address, as the daemon sees it." },
                         "default": problem
@@ -537,13 +570,38 @@ fn access_paths() -> Vec<(String, Value)> {
                                     the window, at the new address, or the board puts the previous \
                                     one back by itself. The bridge and the modules' ports are never \
                                     brought down; only the address on top of them changes. Only a \
-                                    confirmed document is written to `/etc/network/interfaces`.",
+                                    confirmed document is written to `/etc/network/interfaces`.\n\n\
+                                    Two refusals answer **409** before anything is touched, with \
+                                    no pending change and no `last_revert`: the board has no \
+                                    `br0` (the message lists the bridges it does have), or \
+                                    `/etc/network/interfaces` was written by hand and the request \
+                                    does not carry `\"replace_hand_written\": true`. A confirmed \
+                                    change replaces that whole file and first keeps a copy as \
+                                    `/etc/network/interfaces.hand-written.<unix seconds>`; the \
+                                    path is `file_backup` in the view that confirm answers with. \
+                                    (Before 2.41.0 the file was overwritten without a copy.) The \
+                                    image's own default file is not counted as hand-written. \
+                                    Any other failure is a 500 whose message is the command that \
+                                    failed and what it printed.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object",
-                        "description": "An address document, plus an optional window_s."
+                        "description": "An address document, plus an optional window_s and an \
+                                        optional replace_hand_written.",
+                        "properties": {
+                            "window_s": { "type": "integer" },
+                            "replace_hand_written": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Agree to replace a hand-written \
+                                                /etc/network/interfaces on confirm. A copy is \
+                                                kept."
+                            }
+                        }
                     })}}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
+                        "409": { "description": "There is no br0 to change, or the interfaces file was written by hand and replace_hand_written was not sent. Nothing was changed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -559,7 +617,10 @@ fn access_paths() -> Vec<(String, Value)> {
                                     apply the old one is gone, so reaching the daemon at all is the \
                                     proof. A confirmation from the board itself never used the \
                                     address and is refused with 403. Writes the document to \
-                                    `/etc/network/interfaces`.",
+                                    `/etc/network/interfaces`; when that file was not written \
+                                    by the daemon, a copy of it is kept first as \
+                                    `/etc/network/interfaces.hand-written.<unix seconds>` and \
+                                    reported as `file_backup`.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object",
                         "properties": { "token": { "type": "string" } },
@@ -619,6 +680,98 @@ fn access_paths() -> Vec<(String, Value)> {
                                     maximum, so no client hard-codes a number the daemon publishes.",
                     "responses": {
                         "200": { "description": "prefix_min, prefix_max, window_default_s, window_min_s, window_max_s." },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/storage".to_string(),
+            json!({
+                "get": {
+                    "summary": "Whether the board is keeping its settings",
+                    "operationId": "getStorage",
+                    "description": "A board that cannot mount its settings volume boots anyway, \
+                                    on a temporary layer in RAM, so every reboot is a factory \
+                                    reset (password `turing`, a new certificate). The same layer \
+                                    is used on purpose when KEY1 is held at power-on. This says \
+                                    which the board is in.\n\n\
+                                    `state` is read from the mount table, which is the authority: \
+                                    `temporary` when `/` is an overlay whose upper directory is \
+                                    under `/tmp/safemode/`, `persistent` for an overlay with any \
+                                    other upper directory (normally `/mnt/overlay/upper`), \
+                                    `unknown` otherwise. `reason`, only when `temporary`, is \
+                                    `requested` (the kernel command line contains `safemode`, \
+                                    i.e. KEY1 was held; this wins over the reason file), \
+                                    `mount_failed`, or `unrecorded` (the firmware before 2.46.0 \
+                                    writes no reason and the key was not held); it is `null` \
+                                    otherwise. `detail` is the free text \
+                                    firmware 2.46.0 and later records with the reason, trimmed and \
+                                    cut to 8 KiB, or `null`. `backing` is what the read-only root \
+                                    is on: `ubi` (the built-in flash), `mmc` (the SD card) or \
+                                    `unknown`.\n\n\
+                                    `repairable` is true only when the state is `temporary`, the \
+                                    reason is `mount_failed` or `unrecorded`, the backing is \
+                                    `ubi`, a UBI volume named `overlay` exists, and nothing is \
+                                    mounted at `/mnt/overlay`. Otherwise `repair_blocker` says \
+                                    why in one sentence.",
+                    "responses": {
+                        "200": { "description": "What the board is running on.",
+                                 "content": { "application/json": { "schema": component_ref("StorageStatus") } } },
+                        "default": problem
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/bmc/storage/repair".to_string(),
+            json!({
+                "post": {
+                    "summary": "Remove the settings volume that will not mount, and reboot",
+                    "operationId": "repairStorage",
+                    "description": "Runs `ubirmvol /dev/ubi0 -N overlay`, then reboots the BMC \
+                                    about two seconds later so this response can arrive. On the \
+                                    next boot the firmware's preinit finds no settings volume and \
+                                    creates a fresh one.\n\n\
+                                    **This permanently erases what is on the settings volume**: \
+                                    network configuration, certificates, node names, application \
+                                    data. It is not being loaded now, but it cannot be recovered \
+                                    afterwards. A mount failure can be transient, so try a plain \
+                                    reboot first. **It also reboots the BMC**, which on a v2.4 \
+                                    board power-cycles the four compute modules. The board is a \
+                                    factory unit afterwards: password `turing`, a new \
+                                    certificate.\n\n\
+                                    The body must be sent as `Content-Type: application/json`; \
+                                    any other type is a 415. The removal (60 s at most) and the \
+                                    reboot are one piece of work that does not depend on this \
+                                    request staying connected.\n\n\
+                                    Whether repair is on offer is worked out again from the board \
+                                    for every request, from the same facts as `GET \
+                                    /api/bmc/storage`; an earlier answer is never trusted. When it \
+                                    is not, the answer is 409 and the message is that \
+                                    `repair_blocker`, and nothing is run. A failed `ubirmvol` is a \
+                                    500 carrying what it printed; nothing is rebooted.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
+                        "type": "object",
+                        "properties": { "confirm": { "type": "boolean",
+                            "description": "Must be `true`; anything else is a 400." } },
+                        "required": ["confirm"]
+                    })}}},
+                    "responses": {
+                        "202": { "description": "The volume is removed and the board reboots shortly.",
+                                 "content": { "application/json": { "schema": json!({
+                                     "type": "object",
+                                     "properties": { "rebooting": { "type": "boolean" } },
+                                     "required": ["rebooting"]
+                                 })}}},
+                        "400": { "description": "`confirm` was not `true`, or the body was not the request.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "415": { "description": "The content type was not `application/json`.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "409": { "description": "Repair is not on offer; the message is `repair_blocker`.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
+                        "500": { "description": "`ubirmvol` failed or did not finish in 60 s; the message carries what it printed.",
+                                 "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
                 }
@@ -853,6 +1006,25 @@ pub fn document() -> Value {
         }),
     );
     schema_components.insert(
+        "StorageStatus".to_string(),
+        json!({
+            "type": "object",
+            "description": "Whether the board keeps its settings. See GET /api/bmc/storage.",
+            "properties": {
+                "state": { "type": "string", "enum": ["persistent", "temporary", "unknown"] },
+                "reason": { "type": ["string", "null"], "enum": ["requested", "mount_failed", "unrecorded", null],
+                            "description": "Only when `state` is `temporary`." },
+                "detail": { "type": ["string", "null"], "maxLength": 8192,
+                            "description": "Free text recorded with the reason by firmware 2.46.0 and later." },
+                "backing": { "type": "string", "enum": ["ubi", "mmc", "unknown"] },
+                "repairable": { "type": "boolean" },
+                "repair_blocker": { "type": ["string", "null"],
+                                    "description": "One sentence on why repair is not offered; null when it is." }
+            },
+            "required": ["state", "reason", "detail", "backing", "repairable", "repair_blocker"]
+        }),
+    );
+    schema_components.insert(
         "AccessState".to_string(),
         json!({
             "type": "object",
@@ -916,7 +1088,12 @@ pub fn document() -> Value {
                             Every operation here is also reachable in the legacy form `GET /api/bmc?opt=&type=`, \
                             which older clients speak and which is not going away.\n\n\
                             **A board still on its factory password answers 403 to everything here** except \
-                            `/authenticate`, `/access` and `/access/password`. Boards ship as `root` / \
+                            `/authenticate`, `/access`, `/access/password`, `GET /storage` and \
+                            `POST /storage/repair` (a board in safe mode is always on the factory \
+                            password, and these are how its owner is told and can fix it; this \
+                            opens nothing new, because the stock firmware's sshd already lets \
+                            `root` / `turing` in with a shell, and it must be revisited if SSH is \
+                            ever hardened). Boards ship as `root` / \
                             `turing`, which is printed in the quick-start guide and is the same on every \
                             board, so until it is changed the only thing the board will do is let you change \
                             it. The refusal is `application/problem+json` and says so. Requests from the \
@@ -1006,6 +1183,8 @@ mod tests {
         ("/api/bmc/network/address/revert", "post"),
         ("/api/bmc/network/address/validate", "post"),
         ("/api/bmc/network/address/limits", "get"),
+        ("/api/bmc/storage", "get"),
+        ("/api/bmc/storage/repair", "post"),
     ];
 
     #[test]
@@ -1206,6 +1385,31 @@ mod tests {
     ///
     /// So: build what the board would send, and hold it against what the
     /// document promises.
+    #[test]
+    fn what_the_storage_report_serialises_matches_its_schema() {
+        use crate::app::storage_status::tests::{board_mounts, SAFEMODE_LINE};
+        use crate::app::storage_status::{assess, parse_mounts, Facts};
+        // The null-heavy answer, and one with every field filled.
+        let mut facts = Facts {
+            mounts: parse_mounts(&board_mounts(SAFEMODE_LINE, false)),
+            ..Facts::default()
+        };
+        facts.ubi_volumes = vec!["overlay".to_string()];
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&facts)).unwrap(),
+        );
+        facts.reason_file = Some("reason=mount_failed\nUBIFS error\n".to_string());
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&facts)).unwrap(),
+        );
+        assert_valid(
+            "StorageStatus",
+            &serde_json::to_value(assess(&Facts::default())).unwrap(),
+        );
+    }
+
     #[test]
     fn a_board_with_no_promotion_log_still_matches_the_firmware_slots_schema() {
         // `promotion_history` carries skip_serializing_if, so this instance

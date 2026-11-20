@@ -44,9 +44,11 @@ use serde::Serialize;
 /// `GET /api/bmc/about` -- what this board and this daemon are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct About {
-    /// From the board's EEPROM. Empty on a board that cannot be read, rather
-    /// than absent: upstream's shape, and the interface renders the blank.
+    /// From the board's EEPROM. Empty on a board that cannot be read, and on
+    /// one whose EEPROM was never programmed, rather than absent: upstream's
+    /// shape, and the interface renders the blank.
     pub board_model: String,
+    /// Same: empty when the EEPROM has no revision in it.
     pub board_revision: String,
     /// `None` when the EEPROM field is missing or blank after trimming.
     pub board_serial: Option<String>,

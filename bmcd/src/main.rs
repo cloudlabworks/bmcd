@@ -152,8 +152,17 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Whether the settings survive a reboot. A board that could not mount its
+    // settings volume boots anyway, on a layer in RAM, and says nothing; the
+    // log is where that is first written down.
+    let storage = Data::new(crate::app::storage_status::StorageService::system());
+    storage.log_startup().await;
+
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
-    let serial_service = Data::new(SerialConnections::new());
+    // Each port opens at the speed stored for its node, 115200 when there is
+    // none, and follows the setting from then on.
+    let serial_service = Data::new(SerialConnections::new(bmc.node_bauds().await));
+    bmc.attach_serial(serial_service.clone().into_inner());
     let streaming_data_service = Data::new(StreamingDataService::new());
     let authentication = Arc::new(
         LinuxAuthenticator::new(
@@ -239,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
                         .app_data(certificate.clone())
                         .app_data(switch.clone())
                         .app_data(address.clone())
+                        .app_data(storage.clone())
                         .configure(serial_config)
                         // Legacy API: `GET /api/bmc?opt=&type=`
                         .configure(legacy::config)
@@ -254,7 +264,8 @@ async fn main() -> anyhow::Result<()> {
                         .configure(crate::api::access::config)
                         .configure(crate::api::tls::config)
                         .configure(crate::api::network::config)
-                        .configure(crate::api::address::config),
+                        .configure(crate::api::address::config)
+                        .configure(crate::api::storage::config),
                 )
                 // The web UI. Must be the last item; see `web_ui` for what the
                 // browser may cache.

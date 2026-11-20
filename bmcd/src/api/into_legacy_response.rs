@@ -91,6 +91,14 @@ impl From<anyhow::Error> for LegacyResponse {
         // canonical retryable status, so telling a client 500 for "that
         // device does not exist" asks it to retry an answer that will never
         // change.
+        if let Some(refusal) = e.chain().find_map(|cause| {
+            cause.downcast_ref::<crate::app::bmc_application::NodeInfoRequestError>()
+        }) {
+            // The message names the node and what is wrong and is the whole
+            // answer; the wrapper adds nothing a client could use.
+            return LegacyResponse::bad_request(refusal.to_string());
+        }
+
         let status = if e
             .root_cause()
             .is::<crate::app::cooling_device::CoolingRequestError>()
